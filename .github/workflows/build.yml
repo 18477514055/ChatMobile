@@ -40,6 +40,17 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # ★ 显式补一次执行位。
+      #
+      #   这个仓库的开发机是 Windows —— git 在那边默认 `core.filemode = false`，
+      #   所以 `gradlew` 提交上去是 100644。Linux runner 上 `./gradlew` 于是
+      #   直接 exit 126（Permission denied），报错信息里看不出是权限问题。
+      #
+      #   git 索引里已经改成 100755 了，但这一步是兜底：
+      #   以后任何人从 Windows 重新生成 wrapper，都不会再让 CI 红一次。
+      - name: Ensure gradlew is executable
+        run: chmod +x gradlew
+
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest :core-memory:test :core-tools:test --stacktrace
 
@@ -73,6 +84,9 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure gradlew is executable
+        run: chmod +x gradlew
 
       - name: Build debug
         run: ./gradlew :app:assembleDebug
@@ -136,6 +150,9 @@ jobs:
           RELEASE_KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_KEY_PASSWORD }}
           EOF
+
+      - name: Ensure gradlew is executable
+        run: chmod +x gradlew
 
       - name: Build release
         run: ./gradlew :app:assembleRelease
