@@ -60,7 +60,16 @@ android {
         //   缺一项就整个跳过 ⇒ release 变未签名包，构建脚本不会假装成功。
         if (hasReleaseSigning) {
             create("release") {
-                storeFile = file(releaseStoreFile!!)
+                // ★★ 必须用 rootProject.file()，不能用 file()。
+                //
+                //   在 app/build.gradle.kts 里，`file("release.jks")` 解析成
+                //   `ChatMobile/app/release.jks` —— 而 keystore 在**项目根**。
+                //   报错是 `Keystore file '...\app\release.jks' not found`，
+                //   看着像"文件不存在"，其实是路径基准错了。
+                //
+                //   而且这个错误只在 `validateSigningRelease` 才暴露，
+                //   debug 构建完全不受影响 ⇒ 很容易到"发版那天"才发现。
+                storeFile = rootProject.file(releaseStoreFile!!)
                 storePassword = releaseStorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword

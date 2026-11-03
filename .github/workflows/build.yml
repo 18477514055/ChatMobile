@@ -21,22 +21,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      # ★ core-memory / core-tools 的 toolchain 声明的是 Java 25，
-      #   这里必须跟着装 —— 否则 Gradle 会尝试自动下载并在 CI 上超时。
-      - name: Set up JDK 25 for toolchain
+      # ★★★ 只装 JDK 25，**不要**再单独装 17。
+      #
+      #   两个 setup-java 步骤会互相覆盖 `JAVA_HOME`（后装的赢），
+      #   而 Gradle 的 toolchain 只认 JAVA_HOME 指向的那个 JDK 是否满足版本要求。
+      #
+      #   本项目的实际情况：
+      #     app         → source/target 17（AGP 要求）
+      #     core-*      → toolchain Java 25，jvmTarget 17
+      #   ⇒ 一个 JDK 25 同时满足两者：它能编译 `--release 17` 的代码，
+      #     也正是 toolchain 声明要的那个版本。
+      - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest :core-memory:test :core-tools:test --stacktrace
