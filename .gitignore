@@ -24,6 +24,19 @@ goals
 # ── 本机配置：绝对路径 + SDK 位置，换台机器就不对 ──
 local.properties
 
+# ── 签名密钥（★★★ 泄露 = 别人可以冒名发版）──
+#
+# keystore 一旦进版本库，任何人都能用它签一个"看起来是你发的"安装包，
+# 而且 Android 只校验签名是否一致 ⇒ 已安装用户会**静默接受覆盖升级**。
+# 这是本项目最不可撤销的一类泄露，比 API Key 严重（Key 可以换，签名换不了）。
+#
+# ★ 同一份 keystore 已作为 base64 存在 GitHub Secrets 里，CI 用那个。
+*.jks
+*.keystore
+release.jks
+keystore.properties
+*.b64
+
 # ── 构建产物 ──
 .gradle/
 .kotlin/
