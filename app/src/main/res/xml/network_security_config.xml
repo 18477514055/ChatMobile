@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  明文 HTTP 白名单。
+
+  为什么需要：用户可能接自建服务（本地 Ollama、局域网网关），
+  这些通常只有 http://。Android 9+ 默认禁止明文。
+
+  ★ 注意（2026-11-02 调研结论）：
+    - usesCleartextTraffic 在 targetSdk >= 38 会被忽略，正解是 NSC
+    - 192.168.x.x **不享受** Android 17 的 localhost 明文特例（特例只认 loopback）
+      所以要接局域网设备必须显式写 IP 字面量
+    - 这里只放最常见的几类，用户自定义的地址由设置页在运行时追加
+      （Android 不支持运行时改 NSC，所以实际做法是用一个宽松的 base-config
+       配合应用层校验；见 SettingsRepository）
+-->
+<network-security-config>
+    <!-- 默认仍然禁止明文，安全优先 -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- 仅对以下这些本地场景放开 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <!-- Android 模拟器访问宿主机 -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

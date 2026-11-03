@@ -1,0 +1,101 @@
+# ── 由 dsh-ledger-memory 追加 ──
+# 记忆文件默认不进版本库（含用户原话 / 本机路径 / 私有项目名）
+# ★ 要公开这些内容，请**显式删掉**下面这几行 —— 默认挡是因为泄露不可撤销。
+LEDGER.md
+DECISIONS.md
+JOURNAL.md
+GOALS.md
+LESSONS.md
+PRINCIPLES.md
+.dsh-ledger.json
+/decisions/
+/lessons/
+/goals/
+/_ledger-archive/
+/_ledger-log/
+/_stash/
+/_handoff/
+/_backup/
+decisions
+lessons
+goals
+.dsh-ledger-midturn.log
+
+# ── 本机配置：绝对路径 + SDK 位置，换台机器就不对 ──
+local.properties
+
+# ── 构建产物 ──
+.gradle/
+.kotlin/
+build/
+/app/build/
+/captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+*.log
+
+# ── IDE ──
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+
+# ── 本机调试残留（★ 这一批是公开仓库最危险的东西）──
+#
+# 它们全是 adb 调试时生成的一次性文件：截图、uiautomator dump、临时 Python/Node 脚本、
+# 从手机上拉下来的数据库副本。**包含完整的对话内容、本机绝对路径、API 端点的报文**。
+# 尤其是 _tmp_cm.db / _tmp_cm2.db —— 那是用户真实聊天记录。
+#
+# 判据：`_tmp_*` / `_*[0-9].png` / `_*.xml` 这些命名本来就是我随手起的临时名，
+# 没有一个是项目的一部分 ⇒ 整类挡掉，不要一个个挑（漏一个就泄露一次）。
+_tmp_*
+_tmp_ui_backup/
+_shot*.png
+_dlg*.png
+_gap.png
+_h[0-9]*.png
+_m[0-9]*.png
+_p[0-9]*.png
+_f[0-9]*.png
+_mem_*.png
+_e[0-9]*.xml
+_f[0-9]*.xml
+_h[0-9]*.xml
+_m[0-9]*.xml
+_pin*.xml
+_u[0-9]*.xml
+_ui*.xml
+_probe_*.js
+_new_active.txt
+_arch*.txt
+_arch_payload.json
+
+# ── 逆向与调研草稿（体积大、含本机路径，不进公开仓库）──
+_re/
+_research/
+_scratch/
+
+# ── 本项目内部研究稿（★ 不进公开仓库）──
+#
+# 根目录这几份 .md 是开发过程中的逆向笔记与调研记录：含本机绝对路径、本机用户名、
+# 从 app.asar 解包出来的中间产物路径，以及大量与「这一台机器」绑定的细节。
+# 它们是**写给本项目自己的**，不是写给使用者的 ⇒ 不该混进别人 clone 下来的仓库。
+#
+# ★ 判据：**仓库里只放「别人拿到就能用」的东西。** 研究稿不是。
+/*.md
+!/README.md
+!/CHANGELOG.md
+
+# ── 人设卡：写的是别人的角色设定，不适合随源码公开分发 ──
+人设模版-手机版/
+
+# 由 dsh-ledger-memory 追加
+# ── dsh-ledger-memory：记忆文件默认不进版本库（含用户原话 / 本机路径 / 私有项目名）──
+/extensions/
+extensions
+/66-ChatMobile-ledger-memory/

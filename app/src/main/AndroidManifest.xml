@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      ★ 位置权限：只为了把「大致位置」写进提示词末尾，让模型知道用户在哪个地方
+        （问天气 / 附近的事时才有意义）。
+
+      三条自我约束：
+      1. 只要 COARSE（粗略）：精确位置对这个用途没有任何额外价值，属于越权。
+      2. 两个都标 maxSdkVersion=30 的 FINE 不做 —— 见下。
+      3. 全部用 `tools:node` 无关，不声明 ACCESS_BACKGROUND_LOCATION：
+         后台定位是另一件事，本版完全不需要，声明了也会被商店追问。
+
+      ★ Android 12+ 允许「只给粗略位置」，所以清单里 COARSE 在前、FINE 不声明，
+        系统弹窗就会只问「大致位置」，用户更容易同意，也正好对上我们的用途。
+      ★ 没有这个权限时 App 完全正常：RuntimeFactsProvider 会写
+        "Location: unavailable — do not guess it"。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!--
+      ★★★ 读取手机文件的权限 —— 这里有一个**平台事实**必须讲清，不能含糊过去：
+
+      在 Android 上，「读任意用户文件」从来没有一个通吃的权限。真实情况是：
+
+        Android 9 及更早 (API 28 以下)：READ_EXTERNAL_STORAGE 能读共享存储里的普通文件
+        Android 10~12 (API 29~32)     ：只有媒体（图片/视频/音频），文档受分区存储限制
+        Android 13+   (API 33+)       ：它已失效，被 READ_MEDIA_* 取代，且仍只管媒体
+
+      ⇒ 所以本 App 走**两条路**，各司其职：
+
+      1. SAF（Storage Access Framework）—— 主力，不需要任何权限
+         用户用系统选择器挑一个目录/文件，我们就拿到那一份的读写权。
+         权限范围正好等于用户选的，不多一分。工作区功能走的就是这条。
+
+      2. READ_EXTERNAL_STORAGE —— 兼容老设备
+         只在 API 32 及以下声明，用于旧机器上直接读共享存储里的文档。
+         新系统上它会被静默忽略，所以不能依赖它。
+
+      ★ 为什么不申请 MANAGE_EXTERNAL_STORAGE（全盘文件访问）：
+        那是 Play 的高危权限，要专门的声明与审核，而且对一个聊天客户端
+        是明显的过度授权 —— 用户凭什么相信一个聊天 App 要读全部文件？
+        SAF 已经能覆盖「用户主动给我看某个目录」这个真实需求。
+
+      ★ maxSdkVersion="32" 是故意的：在 33+ 上声明它只会让审核问
+        「你要这个干嘛」，而系统根本不会给你。
+
+      ★ 注意：XML 注释里不能出现连续两个减号（这是 XML 规范），
+        所以上面的表格改成了缩进列表的写法。
+    -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ChatMobile">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.ChatMobile">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

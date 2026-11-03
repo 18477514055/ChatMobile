@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      主题继承 Material3 DayNight。
+      colorPrimary 等实际配色在 Compose 的 ChatMobileTheme 里定义，
+      这里只保证冷启动窗口不出白屏/黑屏闪烁。
+    -->
+    <style name="Theme.ChatMobile" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>
