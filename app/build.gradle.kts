@@ -53,8 +53,11 @@ android {
         applicationId = "com.chatmobile"
         minSdk = 26          // ReTerminal 用 26 也能跑 proot，将来加容器不用改
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        // ★ 版本号规则：versionCode 必须严格递增，**不能复用**。
+        //   0.2.0 = 工具系统（懒加载三态 / MCP 客户端）+ 提示词模板 +
+        //           公式真排版 + 全格式附件 + 那个 items 引号修复
+        versionCode = 2
+        versionName = "0.2.0"
 
         // ★ 只出 arm64-v8a：向量增强包用 ONNX Runtime（native 库），
         //   四个 ABI 全打会让 APK 白涨一倍；验证机与绝大多数现役手机都是 arm64。
