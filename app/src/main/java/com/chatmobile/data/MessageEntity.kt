@@ -62,6 +62,23 @@ data class MessageEntity(
     val parentId: String? = null,
     /** 会话内单调序号，见类注释。0 表示"尚未分配"，由 insert 时填上 */
     val seq: Long = 0L,
+    /**
+     * 附件元数据（**JSON 数组**，null = 没有附件）。
+     *
+     * ★★★ 为什么不建一张 `attachment` 表：
+     *   附件永远**随消息一起**读、一起删、一起翻页 —— 没有"单独查附件"的场景。
+     *   建表就得在每个查询点 JOIN，而 99% 的消息根本没有附件，JOIN 纯亏。
+     *   一列 JSON 足够表达"这条消息带了哪些附件"。
+     *
+     * ★ 存的是**元数据**（kind / name / mime / size），**不存图片字节**。
+     *   字节在发送那一刻才从私有目录读（见 `net.ChatAttachment` 的注释）——
+     *   否则一张 4MB 照片 base64 后 5.3MB，库会迅速涨到 GB 级，
+     *   而且每次翻页都跟着读出来。
+     *
+     * ★ 老行为兼容：该列为 NULL ⇒ 就是"没有附件"，
+     *   `MessageAttachmentCodec.decode(null)` 返回空列表，不需要任何兜底分支。
+     */
+    val attachments: String? = null,
 )
 
 /** 角色。落库值就是 [value]，不要改 —— 改了历史数据就读不出来了。 */

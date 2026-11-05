@@ -413,8 +413,8 @@ internal fun MemoriesScreen(
     onAdd: (String, String) -> Unit,
     onMergeGroup: (List<String>) -> Unit,
     onPurgeDeleted: () -> Unit,
-    customPrompt: String = "",
-    onSavePrompt: (String) -> Unit = {},
+    promptTemplates: com.chatmobile.prompt.PromptTemplateSet = com.chatmobile.prompt.PromptTemplateSet(),
+    onSavePromptTemplates: (com.chatmobile.prompt.PromptTemplateSet) -> Unit = {},
     memoryTuning: MemoryTuning = MemoryTuning(),
     onSaveTuning: (MemoryTuning) -> Unit = {},
     modifier: Modifier = Modifier,
@@ -496,8 +496,8 @@ internal fun MemoriesScreen(
     ) { padding ->
         if (tab == 1) {
             PromptTab(
-                customPrompt = customPrompt,
-                onSavePrompt = onSavePrompt,
+                templates = promptTemplates,
+                onSaveTemplates = onSavePromptTemplates,
                 modifier = Modifier.fillMaxSize().padding(padding),
             )
         } else if (tab == 2) {

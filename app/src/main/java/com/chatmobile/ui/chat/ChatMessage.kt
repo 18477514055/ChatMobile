@@ -19,6 +19,13 @@ data class ChatMessage(
     val isStreaming: Boolean = false,
     /** 时间戳，用于分组展示。 */
     val timestamp: Long = 0L,
+    /**
+     * 这条消息携带的附件（**元数据**，不含字节）。
+     *
+     * ★ 只用于显示"带了什么"（气泡下方的小标签）。
+     *   真正的字节在发送那一刻才读（见 `attachments.AttachmentReader`）。
+     */
+    val attachments: List<com.chatmobile.data.MessageAttachmentMeta> = emptyList(),
 ) {
     enum class Role { User, Assistant }
 }
@@ -28,4 +35,13 @@ data class Conversation(
     val id: String,
     val title: String,
     val updatedAt: Long = 0L,
+    /**
+     * 是否置顶。
+     *
+     * ★ 排序**不在这里做** —— 库里的查询已经是 `pinned DESC, updatedAt DESC`
+     *   （有复合索引 `(archived, pinned, updatedAt)`）。这里带这个字段只用于
+     *   **画置顶标记**与**决定菜单该显示"置顶"还是"取消置顶"**。
+     *   如果在 UI 层再排一次，两处排序规则迟早会不一致。
+     */
+    val pinned: Boolean = false,
 )

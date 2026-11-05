@@ -84,6 +84,14 @@ class SettingsStore(private val context: Context) {
         val CUSTOM_PROMPT = stringPreferencesKey("custom_prompt")
 
         /**
+         * 提示词模板集合（JSON）。
+         *
+         * ★ 与 [CUSTOM_PROMPT] 的关系：老键只用于**一次性迁移**（见 `promptTemplates()`），
+         *   新逻辑一律读写这个键。老键保留不删，便于回退版本。
+         */
+        val PROMPT_TEMPLATES = stringPreferencesKey("prompt_templates")
+
+        /**
          * 记忆库可调参数的**稀疏覆盖**（见 [MemoryTuning]）。
          *
          * ★ 只存用户改过的项；没改的回落 `MemoryConfig()` 默认值。
@@ -103,6 +111,15 @@ class SettingsStore(private val context: Context) {
         val TOOLS_ENABLED = stringPreferencesKey("tools_enabled")
 
         /**
+         * 已保存的 MCP 服务器配置（JSON 数组）。
+         *
+         * ★ 只存**探测确认过**的地址/显示名/传输方式，**不存工具清单** ——
+         *   清单是服务端随时可能改的，存下来一定会过期，而过期的清单
+         *   会让模型调用一个已经不存在的工具。
+         */
+        val MCP_SERVERS = stringPreferencesKey("mcp_servers")
+
+        /**
          * 工具结果回填的最大字符数。**用户可调**。
          *
          * ★ 为什么做成设置项而不是常量：上下文窗口大小因模型而异。
@@ -110,6 +127,20 @@ class SettingsStore(private val context: Context) {
          *   写死一个数字必然对某一半用户是错的。
          */
         val TOOL_RESULT_CHARS = stringPreferencesKey("tool_result_chars")
+
+        /**
+         * 专用搜索服务（可选）。空 = 跟随当前模型自己的接入点。
+         *
+         * ★ 三级的第三级：用户在这里填一个**任意 OpenAI 兼容的搜索端点**
+         *   （自带 key），之后**所有模型**都用它搜索。
+         *   典型用法：模型用的是便宜的家用模型，但搜索想用 DeepSeek 的
+         *   `$0.75/1000 次`官方 Search，就填 `https://api.deepseek.com` + 那把 key。
+         *
+         * ★ 为什么分成两个 key 而不是一个 JSON：设置页是两个独立输入框，
+         *   分成两条记录可以各自独立更新，改地址不会把 key 冲掉。
+         */
+        val SEARCH_ENDPOINT = stringPreferencesKey("search_endpoint")
+        val SEARCH_API_KEY = stringPreferencesKey("search_api_key")
 
         /**
          * 思考过程的展开程度（`ReasoningDisplay.name`）。
@@ -283,6 +314,58 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.CUSTOM_PROMPT] = text }
     }
 
+    // ---------------------------------------------------------------
+    // 提示词模板
+    // ---------------------------------------------------------------
+
+    /** 兼容旧数据时用的固定 id（`PromptTemplateCodec.LEGACY_ID` 的镜像）。 */
+    private val legacyTemplateId = "legacy-custom-prompt"
+
+    /**
+     * 读**模板集合 + 当前选中**。
+     *
+     * ## ★★★ 这里带着一次性的旧数据迁移，是本次改版最不能漏的一步
+     *
+     * 升级前只有一个 `custom_prompt: String`。若这里直接读新键，
+     * **老用户会看到空模板列表** —— 他写的人设凭空消失（数据还在，但界面上没有了，
+     * 而且下一轮请求也不会再注入它）。那是最糟的观感："升级把我说的话弄没了"。
+     *
+     * ⇒ 规则：**新键为空 且 老键非空** ⇒ 把老字符串变成一个模板并**默认选上**。
+     *   - 老键**不删**（万一要回退版本，数据还在）
+     *   - 迁移是幂等的：只要新键有内容就不再执行
+     */
+    suspend fun promptTemplates(): com.chatmobile.prompt.PromptTemplateSet {
+        val prefs = context.dataStore.data.first()
+        val decoded = com.chatmobile.prompt.PromptTemplateCodec.decode(prefs[Keys.PROMPT_TEMPLATES])
+        val legacy = prefs[Keys.CUSTOM_PROMPT].orEmpty()
+        val migrated = com.chatmobile.prompt.PromptTemplateCodec.migrateFromLegacy(decoded, legacy)
+        // ★ 迁移结果要**落盘**一次，否则每次读都要重算，而且用户改名后会被覆盖回去。
+        if (migrated != decoded) {
+            context.dataStore.edit { p ->
+                p[Keys.PROMPT_TEMPLATES] = com.chatmobile.prompt.PromptTemplateCodec.encode(migrated)
+            }
+        }
+        return migrated
+    }
+
+    /** 整表覆盖（新建 / 改名 / 改正文 / 删除 / 切换选中都走它）。 */
+    suspend fun setPromptTemplates(set: com.chatmobile.prompt.PromptTemplateSet) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.PROMPT_TEMPLATES] = com.chatmobile.prompt.PromptTemplateCodec.encode(set)
+        }
+    }
+
+    /**
+     * **当前真正要注入的那段提示词** —— 注入点只该读这一个。
+     *
+     * ★ 单一入口：不要在注入处自己去碰 `promptTemplates()` 再取 `.selected.text`。
+     *   否则"选中项已被删"这类边界会在每个调用点各错一次。
+     *
+     * ★ 注意它**读的是模板**，不回落到旧的 `customPrompt` ——
+     *   回落会让"用户明确选了不使用模板"变成"旧内容又偷偷回来了"。
+     */
+    suspend fun effectivePromptText(): String = promptTemplates().effectiveText
+
     /** 记忆库参数。传 `MemoryTuning()` 即恢复全默认。 */
     val memoryTuningFlow: Flow<MemoryTuning> = context.dataStore.data.map { prefs ->
         MemoryTuning.decode(prefs[Keys.MEMORY_TUNING])
@@ -297,39 +380,29 @@ class SettingsStore(private val context: Context) {
     // ---------------------------------------------------------------
 
     /**
-     * 当前**启用的工具名集合**。
+     * 当前**可用的工具名集合** —— 常驻 + 懒加载，**不含已关闭的**。
      *
-     * ★ 解码规则：串里出现过的以串为准；**没出现过的按 [ChatTools] 的默认值**。
-     *   这条让"新增工具"不需要数据迁移 —— 老用户的串里没有新工具，
-     *   于是新工具自动按它的 `enabledByDefault` 生效。
-     * ★ 未知名字（已被删除的工具）会被忽略 —— 它们不在 `ChatTools.all()` 里，
-     *   上层过滤时自然不会带上，不需要在这里清理。
+     * ★ 语义变过一次，务必注意：升级前它是"启用的工具"（只分开关）。
+     *   现在"可用"包含懒加载 —— 因为它们**真的可以调**（召回之后）。
+     *   ⇒ 执行器的 `enabled` 用这个集合，`lazy` 用 [lazyToolNames]。
+     *
+     * ★ 解码规则：串里出现过的以串为准；**没出现过的按工具的 `preferredMode`**。
+     *   这让"新增工具"不需要数据迁移。
      */
-    suspend fun enabledToolNames(): Set<String> {
-        val raw = context.dataStore.data.map { prefs -> prefs[Keys.TOOLS_ENABLED].orEmpty() }.first()
-        val stored = parseToolFlags(raw)
-        return chatmobile.tools.ChatTools.all()
-            .filter { def -> stored[def.name] ?: def.enabledByDefault }
-            .map { it.name }
-            .toSet()
-    }
+    suspend fun enabledToolNames(): Set<String> =
+        toolModeMap().filterValues { it != chatmobile.tools.ToolMode.Disabled }.keys
 
-    /** 设置页用：每个工具当前的开关状态（含默认值兜底）。 */
-    suspend fun toolEnabledMap(): Map<String, Boolean> {
-        val raw = context.dataStore.data.map { prefs -> prefs[Keys.TOOLS_ENABLED].orEmpty() }.first()
-        val stored = parseToolFlags(raw)
-        return chatmobile.tools.ChatTools.all()
-            .associate { def -> def.name to (stored[def.name] ?: def.enabledByDefault) }
-    }
+    /** 当前**懒加载**的工具名 —— 只进目录，不进完整 schema。 */
+    suspend fun lazyToolNames(): Set<String> =
+        toolModeMap().filterValues { it == chatmobile.tools.ToolMode.Lazy }.keys
 
-    /** 只改一个工具的开关，其余保持不变（把当前完整状态写回去）。 */
-    suspend fun setToolEnabled(name: String, enabled: Boolean) {
-        val current = toolEnabledMap().toMutableMap()
-        current[name] = enabled
-        context.dataStore.edit { prefs ->
-            prefs[Keys.TOOLS_ENABLED] = encodeToolFlags(current)
-        }
-    }
+    /** 当前**常驻**的工具名。 */
+    suspend fun residentToolNames(): Set<String> =
+        toolModeMap().filterValues { it == chatmobile.tools.ToolMode.Resident }.keys
+
+    /** 设置页用：每个工具的开关状态（`true` = 不是关闭）。保留给旧调用点。 */
+    suspend fun toolEnabledMap(): Map<String, Boolean> =
+        toolModeMap().mapValues { it.value != chatmobile.tools.ToolMode.Disabled }
 
     /**
      * 工具结果回填上限（字符）。
@@ -348,7 +421,174 @@ class SettingsStore(private val context: Context) {
         }
     }
 
+    // ---------------------------------------------------------------
+    // 专用搜索服务（可选）
+    // ---------------------------------------------------------------
+
+    /**
+     * 用户单独配的搜索端点。
+     *
+     * ★ 返回 `null` 表示**没有单独配置** ⇒ 搜索要跟随当前模型自己的接入点。
+     *   这正是用户要的第一级：「默认复用模型现在的 key 去搜索」。
+     * ★ 只有 base 有值、key 为空时也返回 null —— 没有凭据的地址只会 401，
+     *   不如直接回落到"用模型自己的"。
+     */
+    suspend fun searchEndpoint(): com.chatmobile.tools.SearchEndpoint? {
+        val prefs = context.dataStore.data.first()
+        val base = prefs[Keys.SEARCH_ENDPOINT].orEmpty().trim()
+        val key = prefs[Keys.SEARCH_API_KEY].orEmpty().trim()
+        if (base.isEmpty() || key.isEmpty()) return null
+        return com.chatmobile.tools.SearchEndpoint(base = base, apiKey = key)
+    }
+
+    suspend fun setSearchEndpoint(base: String, apiKey: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SEARCH_ENDPOINT] = base.trim()
+            prefs[Keys.SEARCH_API_KEY] = apiKey.trim()
+        }
+    }
+
     /** `a|1|b|0` ⇒ `{a:true,b:false}`。坏数据（奇数段/非 0-1）一律跳过，不让它整串失效。 */
+    /**
+     * 每个工具当前的**模式**（常驻 / 懒加载 / 关闭）。
+     *
+     * ## ★★★ 存储兼容：老配置只有布尔开关
+     *
+     * 升级前存的是 `name|1|name2|0|...`。现在每项可以是
+     * `1`（常驻）/ `2`（懒加载）/ `0`（关闭）。
+     *
+     * ⇒ 解码用 [ToolMode.fromLegacyFlag]：`1` 仍解析成常驻、`0` 仍解析成关闭。
+     *   **绝不能让老用户升级后所有工具突然变成懒加载** —— 那会让每次调用多一跳往返，
+     *   而他根本没改过设置。
+     *
+     * ★ 没出现过的工具按 [ToolDefinition.preferredMode]（内建默认「高频常驻、其余按需」）。
+     *
+     * ## ★★★ 为什么要接受额外的 [dynamic]
+     *
+     * MCP 工具是**运行时**才有定义的 —— 它们不在 `ChatTools.all()` 里。
+     * 若这里只遍历内建表，MCP 工具就永远拿不到模式 ⇒ 它们既不会出现在常驻里，
+     * 也不会出现在懒加载里，等于**加进来却不存在**。
+     *
+     * ⇒ 由调用方把当轮的动态工具定义传进来，这里一并算上。
+     *   默认值走它们自己的 `preferredMode`（MCP 一律 Lazy）。
+     */
+    suspend fun toolModeMap(
+        dynamic: List<chatmobile.tools.ToolDefinition> = emptyList(),
+    ): Map<String, chatmobile.tools.ToolMode> {
+        val raw = context.dataStore.data.map { prefs -> prefs[Keys.TOOLS_ENABLED].orEmpty() }.first()
+        val stored = parseToolModes(raw)
+        val all = chatmobile.tools.ChatTools.all() + dynamic
+        return all.associate { def ->
+            def.name to (stored[def.name] ?: def.preferredMode)
+        }
+    }
+
+    /** 只改一个工具的模式，其余保持不变。 */
+    suspend fun setToolMode(name: String, mode: chatmobile.tools.ToolMode) {
+        val current = toolModeMap().toMutableMap()
+        current[name] = mode
+        context.dataStore.edit { prefs ->
+            prefs[Keys.TOOLS_ENABLED] = encodeToolModes(current)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // MCP 服务器
+    // ------------------------------------------------------------------
+
+    /** 读已保存的 MCP 服务器（损坏时返回空表，不让 App 起不来）。 */
+    suspend fun mcpServers(): List<com.chatmobile.mcp.McpServerConfig> {
+        val raw = context.dataStore.data
+            .map { prefs -> prefs[Keys.MCP_SERVERS].orEmpty() }
+            .first()
+        return com.chatmobile.mcp.McpConfigCodec.decode(raw)
+    }
+
+    /** 整表覆盖（加/删/改都走它 —— MCP 配置条目很少，不需要增量）。 */
+    suspend fun setMcpServers(list: List<com.chatmobile.mcp.McpServerConfig>) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.MCP_SERVERS] = com.chatmobile.mcp.McpConfigCodec.encode(list)
+        }
+    }
+
+    /**
+     * 追加一个（已确认过的）MCP 服务器。
+     *
+     * ★ 前缀由这里**统一分配**，不让调用方随意给 ——
+     *   否则两个服务器可能拿到同一个前缀，工具名就撞了。
+     */
+    suspend fun addMcpServer(
+        draft: com.chatmobile.mcp.McpDraft,
+    ): com.chatmobile.mcp.McpServerConfig {
+        val current = mcpServers().toMutableList()
+        var prefix = com.chatmobile.mcp.McpConfigCodec.prefixFrom(draft.serverName)
+        // ★ 前缀去重：撞了就加序号。MCP 规范明确说 serverInfo.name 不唯一。
+        val taken = current.map { it.prefix }.toSet()
+        if (prefix in taken) {
+            var i = 2
+            while ("${prefix}$i" in taken) i++
+            prefix = "${prefix}$i"
+        }
+        val cfg = com.chatmobile.mcp.McpServerConfig(
+            name = draft.serverName,
+            url = draft.url,
+            transport = draft.transport,
+            enabled = true,
+            prefix = prefix,
+        )
+        current += cfg
+        setMcpServers(current)
+        return cfg
+    }
+
+    /** 删除一个 MCP 服务器（按 url 认身份，显示名可能被改过）。 */
+    suspend fun removeMcpServer(url: String) {
+        setMcpServers(mcpServers().filterNot { it.url == url })
+    }
+
+    /** 启用/停用一个 MCP 服务器。 */
+    suspend fun setMcpEnabled(url: String, enabled: Boolean) {
+        setMcpServers(
+            mcpServers().map { if (it.url == url) it.copy(enabled = enabled) else it },
+        )
+    }
+
+    /** 兼容旧调用点：true ⇒ 常驻，false ⇒ 关闭（不会设成懒加载）。 */
+    suspend fun setToolEnabled(name: String, enabled: Boolean) {
+        setToolMode(
+            name,
+            if (enabled) chatmobile.tools.ToolMode.Resident else chatmobile.tools.ToolMode.Disabled,
+        )
+    }
+
+    private fun parseToolModes(raw: String): Map<String, chatmobile.tools.ToolMode> {
+        if (raw.isBlank()) return emptyMap()
+        val parts = raw.split('|')
+        val out = mutableMapOf<String, chatmobile.tools.ToolMode>()
+        var i = 0
+        while (i + 1 < parts.size) {
+            val name = parts[i].trim()
+            val flag = parts[i + 1].trim()
+            if (name.isNotEmpty()) {
+                chatmobile.tools.ToolMode.fromLegacyFlag(flag)?.let { out[name] = it }
+            }
+            i += 2
+        }
+        return out
+    }
+
+    /** 按 [ChatTools.all] 的**固定顺序**编码 —— 让这一串也逐字节稳定。 */
+    private fun encodeToolModes(map: Map<String, chatmobile.tools.ToolMode>): String =
+        chatmobile.tools.ChatTools.all()
+            .joinToString("|") { def ->
+                val mode = map[def.name] ?: def.preferredMode
+                def.name + "|" + when (mode) {
+                    chatmobile.tools.ToolMode.Resident -> "1"
+                    chatmobile.tools.ToolMode.Lazy -> "2"
+                    chatmobile.tools.ToolMode.Disabled -> "0"
+                }
+            }
+
     private fun parseToolFlags(raw: String): Map<String, Boolean> {
         if (raw.isBlank()) return emptyMap()
         val parts = raw.split('|')

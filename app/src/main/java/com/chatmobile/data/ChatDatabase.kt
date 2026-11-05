@@ -51,7 +51,7 @@ abstract class ChatDatabase : RoomDatabase() {
 
     companion object {
         /** 改 schema 必须同步 +1，并在 [build] 里挂上对应的 Migration */
-        const val VERSION = 5
+        const val VERSION = 6
 
         const val NAME = "chatmobile.db"
 
@@ -150,6 +150,19 @@ abstract class ChatDatabase : RoomDatabase() {
         }
 
         /**
+         * v5 → v6：`message` 新增 `attachments` 列（附件元数据 JSON）。
+         *
+         * ★ 纯增量 `ADD COLUMN`。老消息该列为 NULL ⇒ 当作"没有附件"，
+         *   行为与升级前完全一致（那时附件只回填文件名，本来就没有附件语义）。
+         * ★ DDL 逐字照抄 `app/schemas/.../6.json` 的 `createSql`。
+         */
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `message` ADD COLUMN `attachments` TEXT")
+            }
+        }
+
+        /**
          * 生产库。
          *
          * ★ 外键 CASCADE 要**显式打开**：SQLite 默认 `foreign_keys=OFF`。
@@ -159,7 +172,13 @@ abstract class ChatDatabase : RoomDatabase() {
         fun build(context: Context): ChatDatabase =
             Room.databaseBuilder(context.applicationContext, ChatDatabase::class.java, NAME)
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(
+                    MIGRATION_1_2,
+                    MIGRATION_2_3,
+                    MIGRATION_3_4,
+                    MIGRATION_4_5,
+                    MIGRATION_5_6,
+                )
                 .build()
 
         /**

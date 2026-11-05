@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -107,7 +108,10 @@ internal fun WorkspacesScreen(
     }
 
     Scaffold(
-        modifier = modifier,
+        // ★★★ 与「模型」「工具」页同一写法：imePadding 加在 Scaffold 外层。
+        //   根因见 ToolsScreen 的注释 —— 只加 navigationBarsPadding() 躲的是导航条，
+        //   不躲键盘，所以键盘一弹就把输入框和按钮压在下面。
+        modifier = modifier.imePadding(),
         topBar = {
             TopAppBar(
                 modifier = Modifier.statusBarsPadding(),

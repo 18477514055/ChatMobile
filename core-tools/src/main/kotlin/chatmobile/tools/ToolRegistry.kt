@@ -55,38 +55,15 @@ class ToolRegistry {
             if (index > 0) sb.append(',')
             sb.append("""{"type":"function","function":{""")
             sb.append(""""name":""").append(jsonString(spec.name))
-            sb.append(""","description":""").append(jsonString(spec.description))
-            sb.append(""","parameters":{"type":"object","properties":{""")
-            spec.parameters.properties.entries.forEachIndexed { i, (pname, pspec) ->
-                if (i > 0) sb.append(',')
-                sb.append(jsonString(pname)).append(":{")
-                sb.append(""""type":""").append(jsonString(pspec.type.jsonName))
-                sb.append(""","description":""").append(jsonString(pspec.description))
-                if (pspec.items != null) {
-                    sb.append(""","items":{"type":""").append(jsonString(pspec.items.jsonName)).append("\"}")
-                }
-                if (pspec.enum != null) {
-                    sb.append(""","enum":[""")
-                    pspec.enum.forEachIndexed { j, v ->
-                        if (j > 0) sb.append(',')
-                        sb.append(jsonString(v))
-                    }
-                    sb.append(']')
-                }
-                sb.append('}')
-            }
-            sb.append("}")
-            if (spec.parameters.required.isNotEmpty()) {
-                sb.append(""","required":[""")
-                spec.parameters.required.forEachIndexed { i, r ->
-                    if (i > 0) sb.append(',')
-                    sb.append(jsonString(r))
-                }
-                sb.append(']')
-            }
-            // ★ 必须有：禁止模型塞未声明的参数。
-            sb.append(""","additionalProperties":false""")
-            sb.append("}}}")
+            // ★★★ 走 spec.fullDescription()，不是拼 spec.description ——
+            //   后者会让「使用示例」永远到不了常驻工具（示例只加在 description 之外的字段里）。
+            sb.append(""","description":""").append(jsonString(spec.fullDescription()))
+            // ★★★ 参数走 spec.parametersJson() 这一个入口：
+            //   结构化工具 → ToolParametersJson.encode()
+            //   MCP 工具   → 服务端给的 inputSchema **原样透传**（含 oneOf/$ref 等，
+            //                我们的简化模型表达不了，降级解析会静默丢约束）
+            sb.append(""","parameters":""").append(spec.parametersJson())
+            sb.append("}}")
         }
         sb.append(']')
         return sb.toString()

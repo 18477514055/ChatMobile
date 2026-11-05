@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -186,6 +187,14 @@ fun QuickSwitchSheet(
             shadowElevation = 8.dp,
             modifier = Modifier
                 .fillMaxWidth()
+                // ★★★ 弹窗里有搜索框，键盘弹起时必须把整个弹窗顶上去。
+                //
+                //   这个 Dialog 设了 `decorFitsSystemWindows = false`（为了让内容
+                //   铺到状态栏下方、居中的观感才对），代价是**它不再自动避让 IME**——
+                //   而 Material 的 ModalBottomSheet 会自动避让，所以这算是个反向陷阱。
+                //   不加这一行，真机上点搜索框 → 弹窗下半部分被键盘盖住，
+                //   连"上下文上限"那个输入框都点不到。
+                .imePadding()
                 .heightIn(max = 560.dp),
         ) {
             Column(modifier = Modifier.padding(16.dp)) {

@@ -37,14 +37,31 @@ object RuntimeFactsProvider {
      *
      * Never throws, never returns a partial/garbled line: worst case it returns a
      * block that says location is unavailable.
+     *
+     * ## ★★★ Workspace must be passed in, or the model sees `none` forever
+     *
+     * `RuntimeFacts.render` has always taken a `workspace` parameter and knows how
+     * to render the path and the permission level. But `collect()` never accepted
+     * one — so `Collections: none` was hard-coded in practice.
+     *
+     * Symptom the user hit: they bound a workspace in the UI, the model still said
+     * 「运行时事实里写着 workspace: none，这轮我一个目录都没挂上」. The UI was fine,
+     * the DB was fine; **this one wire was missing.** Same shape as the reasoning
+     * collapse bug: everything exists except the connection.
+     *
+     * @param workspace `null` = this conversation has no workspace bound.
      */
-    fun collect(context: Context, nowMillis: Long = System.currentTimeMillis()): String {
+    fun collect(
+        context: Context,
+        nowMillis: Long = System.currentTimeMillis(),
+        workspace: RuntimeFacts.WorkspaceInfo? = null,
+    ): String {
         val zone = runCatching { ZoneId.systemDefault() }.getOrElse { ZoneId.of("UTC") }
         val locale = runCatching { Locale.getDefault() }.getOrElse { Locale.ENGLISH }
         val location = runCatching { lastKnownLocation(context) }
             .onFailure { Log.w(TAG, "定位读取失败，按不可用处理", it) }
             .getOrNull()
-        return runCatching { RuntimeFacts.render(nowMillis, zone, locale, location) }
+        return runCatching { RuntimeFacts.render(nowMillis, zone, locale, location, workspace) }
             .getOrElse {
                 Log.w(TAG, "运行时信息渲染失败", it)
                 ""

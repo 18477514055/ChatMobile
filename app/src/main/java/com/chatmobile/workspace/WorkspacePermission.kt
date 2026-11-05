@@ -32,17 +32,18 @@ enum class WorkspacePermission(val label: String, val description: String) {
 
     ReadOnly(
         label = "仅可查看",
-        description = "模型只能读工作区里的文件，不能新建、修改或删除任何东西。",
+        description = "模型能读工作区里的文件，但不能新建、修改或删除任何东西。读取永远不弹确认框。",
     ),
 
     WorkspaceWrite(
         label = "工作区内修改",
-        description = "模型可以在工作区里新建、修改、删除文件，但走不出这个工作区。",
+        description = "模型可以自由读写在**这个工作区里**的文件，不打断你确认。" +
+            "只有动到工作区之外时才会问你。",
     ),
 
     FullAccess(
         label = "完全权限",
-        description = "模型可以读写工作区之外的路径（仍受工具开关与确认框约束，且不能执行命令）。",
+        description = "读、写、改工作区内外的文件都不弹确认框（仍受工具开关与不可执行命令的限制）。",
     ),
     ;
 
@@ -58,9 +59,109 @@ enum class WorkspacePermission(val label: String, val description: String) {
     val canLeaveWorkspace: Boolean
         get() = this == FullAccess
 
+    /**
+     * 这个档位下，**文件操作要不要弹确认框**。
+     *
+     * ## ★★★ 这一条是本档位定义的核心（用户原话）
+     *
+     * > 「如果模型每次改动文件都要问我，会不会让任务断的很难受？只读才需要吧，
+     * >   工作区权限是工作区改不用，工作区外用，完全权限是不用任何确认，
+     * >   此外注意任何读取都不用审批。」
+     *
+     * 拆成四条：
+     * | 情况 | 要不要确认 |
+     * |---|---|
+     * | **任何读取** | **永远不用**（不论档位） |
+     * | 工作区内写 | **不用** |
+     * | 工作区外写（`workspace-write` 档） | **要**（其实权限层会直接拒绝，见下） |
+     * | `full-access` 档 | **任何写都不用** |
+     *
+     * ## ★ 为什么"工作区外写"在这一档其实走不到确认框
+     *
+     * `WorkspaceWrite` 档下，`PermissionGuard` 会**直接拒绝**工作区外的写入
+     * （`canLeaveWorkspace = false`）。所以它根本不会进入"要不要确认"这一步 ——
+     * 拒绝比确认更早发生。
+     *
+     * ⚠️ 但**仍然要把它算成"需要确认"**：将来若有人放宽了拦截（比如改成"先问再放行"），
+     * 这里要能自动跟上，而不是悄悄变成"直接写"。
+     * 这正是「守卫要写在两处、且两侧语义一致」的落点。
+     */
+    fun requiresConfirmation(
+        operation: FileOperation,
+        insideWorkspace: Boolean,
+    ): Boolean = when {
+        // ① 读取永远不确认 —— 不论档位、不论在不在工作区里
+        operation == FileOperation.READ -> false
+        // ② 只读档：写操作由 PermissionGuard **直接拒绝**，不该先问一遍。
+        //    弹一个"允许也没有用"的框比不弹更糟 —— 用户会以为是自己点得不对。
+        this == ReadOnly -> false
+        // ③ 完全权限：任何写都不问
+        this == FullAccess -> false
+        // ④ 工作区内写：不问（这正是用户说的"工作区改不用"）
+        insideWorkspace -> false
+        // ⑤ 工作区外写：要问（当前档位下其实已被 PermissionGuard 先拒）
+        else -> true
+    }
+
+    /**
+     * 写进**运行时事实**的那一串 —— 必须与 `SystemPrompt` 里的字面值逐字一致。
+     *
+     * ## ★★★ 为什么必须逐字一致
+     *
+     * 提示词里写的是：
+     * ```
+     * - `read-only` — ...
+     * - `workspace-write` — ...
+     * - `full-access` — ...
+     * ```
+     * 并且明确交代「你的档位去运行时事实那块读」。如果这里写的是
+     * 「仅可查看」这种中文标签，模型拿到的是一个它在提示词里**从没见过**的词
+     * ⇒ 它只能猜怎么解释，而猜错的代价是**越权尝试或该做的不敢做**。
+     *
+     * ⇒ 两侧共用同一组字符串常量（见 [PROMPT_VALUES]），改一处必须改两处。
+     */
+    val promptValue: String
+        get() = when (this) {
+            ReadOnly -> "read-only"
+            WorkspaceWrite -> "workspace-write"
+            FullAccess -> "full-access"
+        }
+
+    /**
+     * 附在档位后面的一句提醒 —— 让模型**不只看档位名，还知道它的边界在哪**。
+     *
+     * ★ 「完全权限」那一档尤其需要这句：它的名字听起来像"什么都能干"，
+     *   而实际上它只放开了工作区边界，工具集与确认框照样管着。
+     */
+    val promptHint: String
+        get() = when (this) {
+            ReadOnly -> "you may read only; creating, modifying or deleting files will be rejected"
+            WorkspaceWrite -> "you may create, modify and delete files inside this directory only"
+            FullAccess ->
+                "you may also read and write outside this directory, but the tool switches " +
+                    "and confirmation prompts still apply, and you cannot run shell commands"
+        }
+
     companion object {
         fun fromName(raw: String?): WorkspacePermission =
             entries.firstOrNull { it.name == raw } ?: WorkspaceWrite
+
+        /**
+         * 从**提示词字面值**（`read-only` / `workspace-write` / `full-access`）反查档位。
+         *
+         * ★ 为什么需要它：`RuntimeFacts.WorkspaceInfo` 里带的是送给模型的那一串，
+         *   而执行层判档要用枚举。两者之间必须有一个**唯一**的转换入口 ——
+         *   否则每处都手写 `when (str) {...}`，改一处漏一处，
+         *   最后就是「提示词说能写、执行器说不能写」这种前后不一致。
+         *
+         * ★ 认不出时回退 [DEFAULT]（工作区内修改），**不是**回退 [FullAccess]：
+         *   认不出就往宽的方向猜，等于把边界交出去。
+         */
+        fun fromPromptValue(raw: String?): WorkspacePermission =
+            entries.firstOrNull { it.promptValue == raw } ?: DEFAULT
+
+        /** 三档的提示词字面值 —— 契约测试用它跟 `SystemPrompt` 逐字比对。 */
+        val PROMPT_VALUES: List<String> = entries.map { it.promptValue }
 
         /**
          * 默认档位 = [WorkspaceWrite]。

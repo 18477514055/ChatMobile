@@ -1,5 +1,6 @@
 package com.chatmobile.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -14,9 +15,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -33,24 +36,62 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
 /**
- * 「提示词」页：用户自己写的人设/规矩。
+ * 「提示词」页：用户自己写的人设/规矩 —— **以模板形式管理**。
  *
  * ★ 与记忆库的分界（这是产品语义，不是实现细节）：
- *   - **记忆库** = 模型自己观察到的关于你的事实，会被自动抽取、合并、衰减；
+ *   - **记忆库** = 模型自己观察到的关于你的东西，会被自动抽取、合并、衰减；
  *   - **提示词** = 你主动要求它成为什么（人设、口吻、禁区），**只会被你改**。
  *   所以它不进记忆库（否则一次"整理记忆"就能把你写的人设合并掉），
  *   而是紧接着固定提示词注入，位置固定、内容稳定，对缓存友好。
+ *
+ * ## ★★★ 为什么从「一个大文本框」改成「模板列表 + 编辑器」
+ *
+ * 用户原话：「现在允许将提示词保存为一个模板（一个模板包含一个标题和一个提示词文本，
+ * 可以随时切换）」。
+ *
+ * 单文本框的本质问题是**它没有留住任何东西** —— 换人设就得把旧的删掉重写，
+ * 而那些写过的通常是要反复用的。
+ *
+ * ## 交互上的两个刻意的取舍
+ *
+ * 1. **切换是"点了立即生效"**，不需要再点保存 —— 切换是高频小动作，
+ *    再要一次确认会让它变得笨重。
+ * 2. **正文编辑仍然要显式保存** —— 它是低频的、且误改代价大。
+ *    "切换立即、编辑保存"这个组合是有意为之，不是不一致。
  */
 @Composable
 internal fun PromptTab(
-    customPrompt: String,
-    onSavePrompt: (String) -> Unit,
+    /** 模板集合 + 当前选中。 */
+    templates: com.chatmobile.prompt.PromptTemplateSet,
+    onSaveTemplates: (com.chatmobile.prompt.PromptTemplateSet) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // ★ 本地草稿（L12）：不能直接渲染 DataStore 的值再按键落盘，
-    //   异步回流会把用户刚敲的字覆盖回旧值。
-    var draft by remember(customPrompt) { mutableStateOf(customPrompt) }
-    val dirty = draft != customPrompt
+    // 当前正在编辑哪个模板（null = 没在编辑，显示列表）
+    var editingId by remember { mutableStateOf<String?>(null) }
+    // 编辑器草稿（标题 + 正文）
+    var titleDraft by remember { mutableStateOf("") }
+    var textDraft by remember { mutableStateOf("") }
+    // 上一次的错误/提示
+    var notice by remember { mutableStateOf("") }
+
+    val editing = editingId?.let { id -> templates.templates.firstOrNull { it.id == id } }
+    val dirty = editing == null || titleDraft != editing.title || textDraft != editing.text
+
+    /** 进入编辑一个已有模板。 */
+    fun beginEdit(t: com.chatmobile.prompt.PromptTemplate) {
+        editingId = t.id
+        titleDraft = t.title
+        textDraft = t.text
+        notice = ""
+    }
+
+    /** 进入"新建"。 */
+    fun beginNew() {
+        editingId = ""
+        titleDraft = ""
+        textDraft = ""
+        notice = ""
+    }
 
     Column(
         modifier = modifier
@@ -58,50 +99,230 @@ internal fun PromptTab(
             .imePadding()
             .padding(16.dp),
     ) {
-        // ★ 操作行放在**输入框上方**：输入时键盘会盖住下半屏，
-        //   放在下面的「保存」会被键盘挡住（真机实测点不到）。
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "${draft.length} 字" + if (dirty) " · 未保存" else "",
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f),
-            )
-            TextButton(onClick = { draft = customPrompt }, enabled = dirty) {
-                Text("还原", fontSize = 12.sp)
-            }
-            TextButton(onClick = { onSavePrompt(draft.trim()) }, enabled = dirty) {
-                Text("保存", fontSize = 13.sp)
-            }
-        }
         Text(
-            "这里写的是「你要求模型成为什么」——人设、口吻、必须遵守的规矩。",
-            fontSize = 13.sp,
+            "提示词模板",
+            fontSize = 15.sp,
             fontWeight = FontWeight.Medium,
         )
         Text(
-            "它和记忆是两回事：记忆是模型观察到的你，这里是你的指令；记忆整理不会动它。",
+            "一句话人设，或者一整套规矩。可以存多个，随时切换 —— 切换立刻生效。",
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
+            modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
         )
-        OutlinedTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 220.dp),
-            minLines = 8,
-            maxLines = 20,
-            label = { Text("自定义提示词", fontSize = 12.sp) },
-            placeholder = {
-                Text(
-                    "例如：\n你是一位严谨的中文技术助理，回答先给结论再给依据。\n不要使用「作为 AI」这类说法。",
-                    fontSize = 12.sp,
+
+        if (editingId == null) {
+            // ---------------- 列表模式 ----------------
+
+            // ★「不使用模板」是一个**明确可选的状态**，不是"没选"。
+            //   用户可能就想要纯净的默认提示词。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onSaveTemplates(templates.copy(selectedId = null)) }
+                    .padding(vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(
+                    selected = templates.selectedId == null,
+                    onClick = { onSaveTemplates(templates.copy(selectedId = null)) },
                 )
-            },
-        )
+                Text("不使用模板（只用内置提示词）", fontSize = 13.sp)
+            }
+
+            templates.templates.forEach { t ->
+                val selected = templates.selectedId == t.id
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // ★ 整行可点（L28）：只让 RadioButton 可点的话，
+                        //   手指落在文字上没反应，长条形的行会显得"点不动"。
+                        .clickable {
+                            onSaveTemplates(
+                                com.chatmobile.prompt.PromptTemplatePolicy.select(templates, t.id),
+                            )
+                        }
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = selected,
+                        onClick = {
+                            onSaveTemplates(
+                                com.chatmobile.prompt.PromptTemplatePolicy.select(templates, t.id),
+                            )
+                        },
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(t.title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(
+                            // 正文预览：让人一眼分辨这个模板讲的是什么人设
+                            t.text.replace('\n', ' ').take(40).ifEmpty { "（正文为空）" },
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = { beginEdit(t) }) { Text("编辑", fontSize = 12.sp) }
+                    TextButton(
+                        onClick = {
+                            // ★ 走 Policy.delete：它会**修复选中项**，
+                            //   删掉的正好是当前选中时把它清成 null，
+                            //   而不是偷偷跳到别的模板上（那会让用户以为选择被记住了）。
+                            onSaveTemplates(
+                                com.chatmobile.prompt.PromptTemplatePolicy.delete(templates, t.id),
+                            )
+                            notice = "已删除「${t.title}」"
+                        },
+                    ) {
+                        Text("删除", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
+
+            if (templates.templates.isEmpty()) {
+                Text(
+                    "还没有模板。点下面的「新建」写第一个 —— 比如「严谨技术助理」。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 10.dp),
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { beginNew() },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("新建模板") }
+
+            if (notice.isNotBlank()) {
+                Text(
+                    notice,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        } else {
+            // ---------------- 编辑模式 ----------------
+
+            // ★ 操作行放**输入框上方**：输入时键盘会盖住下半屏，
+            //   放下面的按钮点不到（真机实测过，这条注释在上一版就有）。
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "${textDraft.length} 字" + if (dirty) " · 未保存" else "",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = {
+                    editingId = null
+                    notice = ""
+                }) { Text("返回", fontSize = 12.sp) }
+                TextButton(
+                    enabled = dirty,
+                    onClick = {
+                        val isNew = editingId == ""
+                        val verdict = com.chatmobile.prompt.PromptTemplatePolicy.check(
+                            title = titleDraft,
+                            text = textDraft,
+                            existing = templates.templates,
+                            editingId = editingId?.takeIf { it.isNotEmpty() },
+                        )
+                        when (verdict) {
+                            is com.chatmobile.prompt.PromptTemplatePolicy.Verdict.Rejected -> {
+                                // ★ 判据在 Policy 里，这里只负责显示它说了什么
+                                notice = verdict.reason
+                            }
+                            is com.chatmobile.prompt.PromptTemplatePolicy.Verdict.Ok -> {
+                                if (isNew) {
+                                    val id = "tpl-" + System.currentTimeMillis()
+                                    val created = com.chatmobile.prompt.PromptTemplate(
+                                        id = id,
+                                        title = verdict.title,
+                                        text = verdict.text,
+                                    )
+                                    onSaveTemplates(
+                                        templates.copy(
+                                            templates = templates.templates + created,
+                                            // ★ 新建后**直接选上它** —— 用户点"新建"的意图
+                                            //   就是要用它，还要再点一次选择很多余。
+                                            selectedId = id,
+                                        ),
+                                    )
+                                } else {
+                                    val id = editingId!!
+                                    onSaveTemplates(
+                                        templates.copy(
+                                            templates = templates.templates.map {
+                                                if (it.id == id) {
+                                                    it.copy(title = verdict.title, text = verdict.text)
+                                                } else {
+                                                    it
+                                                }
+                                            },
+                                        ),
+                                    )
+                                }
+                                editingId = null
+                                notice = "已保存"
+                            }
+                        }
+                    },
+                ) {
+                    // ★ 只有新模板可以在还没写标题时点保存 —— 让 Policy 去报原因，
+                    //   比把按钮置灰更容易理解（置灰的用户不知道缺什么）。
+                    Text("保存", fontSize = 13.sp)
+                }
+            }
+
+            OutlinedTextField(
+                value = titleDraft,
+                onValueChange = { titleDraft = it.take(com.chatmobile.prompt.PromptTemplatePolicy.MAX_TITLE + 8) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("标题", fontSize = 12.sp) },
+                placeholder = { Text("例如：严谨技术助理", fontSize = 12.sp) },
+            )
+            Text(
+                "切换模板时你就是靠标题来认的，所以起个一看就懂的名字。",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+            )
+
+            OutlinedTextField(
+                value = textDraft,
+                onValueChange = { textDraft = it },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp),
+                minLines = 7,
+                maxLines = 20,
+                label = { Text("提示词正文", fontSize = 12.sp) },
+                placeholder = {
+                    Text(
+                        "例如：\n你是一位严谨的中文技术助理，回答先给结论再给依据。\n不要使用「作为 AI」这类说法。",
+                        fontSize = 12.sp,
+                    )
+                },
+            )
+            Text(
+                "这一段会被紧接着内置提示词注入。它和记忆是两回事：记忆是模型观察到的你，这里是你的指令。",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+
+            if (notice.isNotBlank()) {
+                Text(
+                    notice,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        }
     }
 }
 
@@ -222,6 +443,11 @@ internal fun MemoryModelConfigDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(max = 460.dp)
+                    // ★★★ 对话框里的输入框**同样会被键盘盖住**，而 Dialog 是独立窗口，
+                    //   外层页面的 imePadding **管不到它**（那是另一个 WindowInsets 消费方）。
+                    //   真机上表现为：点「API 地址」弹键盘，输入框连同「确定」一起被压在下面。
+                    //   ⇒ 对话框内部必须自己消费一次 ime 内边距。
+                    .imePadding()
                     .verticalScroll(rememberScrollState()),
             ) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

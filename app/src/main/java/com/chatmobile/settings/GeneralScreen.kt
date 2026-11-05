@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -90,6 +91,7 @@ internal fun GeneralScreen(
     autoCollapse: ReasoningAutoCollapse,
     themeMode: ThemeMode,
     fontSize: Int,
+    currentVersion: String,
     onBack: () -> Unit,
     onPermissionChange: (WorkspacePermission) -> Unit,
     onDisplayChange: (ReasoningDisplay) -> Unit,
@@ -97,13 +99,38 @@ internal fun GeneralScreen(
     onThemeModeChange: (ThemeMode) -> Unit,
     onFontSizeChange: (Int) -> Unit,
     modifier: Modifier = Modifier,
+    /** 检查更新的状态；null = 还没点过。 */
+    updateState: com.chatmobile.update.UpdateCheck? = null,
+    /** 是否正在检查。 */
+    checkingUpdate: Boolean = false,
+    /** 走的是哪条通道（GitHub API / jsDelivr）；null = 还没成功过。 */
+    updateChannel: com.chatmobile.update.UpdateChecker.Channel? = null,
+    onCheckUpdate: () -> Unit = {},
+    /** 有新版时点「去下载」。 */
+    onOpenUpdate: (com.chatmobile.update.UpdateCheck.Available) -> Unit = {},
+    /** 检查失败时点「手动打开更新页」。 */
+    onOpenUrl: (String) -> Unit = {},
+    /** 是否已授予「所有文件访问权限」。 */
+    allFilesAccessGranted: Boolean = false,
+    /**
+     * 这台机器上「所有文件访问」设置页走哪条路。
+     *
+     * ★ `Unavailable` 时**不给按钮** —— 宁可写明"这台机器没有这个开关"，
+     *   也不留一个点了没反应的按钮（真机踩过：MIUI 把这组设置页整个裁掉了）。
+     */
+    allFilesRoute: com.chatmobile.permission.AllFilesAccessGate.Route =
+        com.chatmobile.permission.AllFilesAccessGate.Route.Unavailable,
+    /** 跳到系统设置里本 App 的「所有文件访问」页。 */
+    onRequestAllFilesAccess: () -> Unit = {},
 ) {
     // ★ 本地草稿：输入即落盘的 Compose 输入框必须持本地草稿（L12）。
     //   直接渲染持久化值会让每次按键都和异步回写打架，字符会被吞。
     var fontDraft by remember(fontSize) { mutableStateOf(fontSize.toString()) }
 
     Scaffold(
-        modifier = modifier,
+        // ★★★ 与「模型」「工具」「工作区」页同一写法：imePadding 加在 Scaffold 外层。
+        //   本页有字号输入框，键盘弹起时必须把内容顶上去，否则输入框会被压住。
+        modifier = modifier.imePadding(),
         topBar = {
             TopAppBar(
                 modifier = Modifier.statusBarsPadding(),
@@ -215,6 +242,286 @@ internal fun GeneralScreen(
                 onSelect = { name ->
                     ReasoningAutoCollapse.fromName(name).let(onAutoCollapseChange)
                 },
+            )
+
+            // ---------------- 版本与更新 ----------------
+            SectionDivider()
+            SectionHeader(
+                title = "版本",
+                subtitle = "点「检查更新」才会联网。平时不会在后台偷偷请求任何地址。",
+            )
+            UpdateSection(
+                currentVersion = currentVersion,
+                state = updateState,
+                checking = checkingUpdate,
+                channel = updateChannel,
+                onCheck = onCheckUpdate,
+                onOpen = onOpenUpdate,
+                onOpenUrl = onOpenUrl,
+            )
+
+            // ---------------- 全盘文件访问 ----------------
+            SectionDivider()
+            SectionHeader(
+                title = "文件访问范围",
+                subtitle = "不授予时：模型只能碰你指定的工作区。授予后：能读写手机上任意目录。",
+            )
+            AllFilesAccessRow(
+                granted = allFilesAccessGranted,
+                route = allFilesRoute,
+                onRequest = onRequestAllFilesAccess,
+            )
+        }
+    }
+}
+
+/**
+ * 全盘文件访问的授权状态 + 入口。
+ *
+ * ## ★★★ 为什么必须有这一行，而不是"申请了权限就行"
+ *
+ * `MANAGE_EXTERNAL_STORAGE` **不是普通运行时权限** ——
+ * `requestPermissions()` 对它无效。用户必须在系统设置里单独打开，
+ * 而且那条设置页是**按 App 区分**的（`ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`）。
+ *
+ * ⇒ 如果只声明不引导，用户永远不知道要去哪儿开，权限就永远不生效 ——
+ *   表现是"我明明装了新版本，模型还是只能碰工作区"。
+ *   这正是本项目反复出现的「机制都在，连接不存在」。
+ *
+ * ## 文案原则
+ *
+ * 两句话必须说清：**现在能给什么** 与 **授予后会多什么**。
+ * 只写一句"授予所有文件访问权限"，用户没法判断该不该点。
+ */
+@Composable
+private fun AllFilesAccessRow(
+    granted: Boolean,
+    route: com.chatmobile.permission.AllFilesAccessGate.Route,
+    onRequest: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(
+                width = 0.5.dp,
+                color = MaterialTheme.colorScheme.outlineVariant,
+                shape = RoundedCornerShape(14.dp),
+            ),
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(
+                text = if (granted) "已授予：模型可以访问手机上任意目录" else "未授予：模型只能访问工作区",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (granted) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+            )
+            if (!granted) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = if (route == com.chatmobile.permission.AllFilesAccessGate.Route.Unavailable) {
+                        // ★★ 这条分支是真机撞出来的：MIUI 没有那个开关。
+                        //    此时**既不给按钮、也不说"去授予"** —— 说了等于指向一扇不存在的门。
+                        com.chatmobile.permission.AllFilesAccessGate.unavailableHint()
+                    } else {
+                        com.chatmobile.permission.AllFilesAccessGate.availableHint()
+                    },
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                // ★ 只有真的能跳过去才给按钮。
+                if (route != com.chatmobile.permission.AllFilesAccessGate.Route.Unavailable) {
+                    Spacer(Modifier.height(4.dp))
+                    // ★ 整行可点（L28）
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onRequest() }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "去授予全盘访问",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 版本号 + 检查更新。
+ *
+ * ★ 四态各走各的 UI（这正是把 [com.chatmobile.update.UpdateCheck] 做成 sealed 的原因）：
+ *   - 没点过 → 只有按钮
+ *   - 有新版 → 版本对比 + 大小 + 「去下载」
+ *   - 已最新 → 一句话
+ *   - 失败   → **原因** + 「重试」
+ */
+@Composable
+private fun UpdateSection(
+    currentVersion: String,
+    state: com.chatmobile.update.UpdateCheck?,
+    checking: Boolean,
+    channel: com.chatmobile.update.UpdateChecker.Channel?,
+    onCheck: () -> Unit,
+    onOpen: (com.chatmobile.update.UpdateCheck.Available) -> Unit,
+    onOpenUrl: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        InfoRow(label = "当前版本", value = currentVersion)
+
+        if (state != null) {
+            when (state) {
+                is com.chatmobile.update.UpdateCheck.Available -> {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = "发现新版本 ${state.latest}",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                            Text(
+                                text = buildString {
+                                    append("当前 ")
+                                    append(state.current.removePrefix("v"))
+                                    append(" → ")
+                                    append(state.latest)
+                                    if (state.apkBytes > 0) {
+                                        append("\n安装包 ")
+                                        append(
+                                            String.format(
+                                                java.util.Locale.US,
+                                                "%.1f",
+                                                state.apkBytes / 1024.0 / 1024.0,
+                                            ),
+                                        )
+                                        append(" MB")
+                                    }
+                                    if (state.apkUrl == null) {
+                                        // ★ 走 CDN 通道时拿不到直链，必须说清楚，
+                                        //   否则用户会奇怪"为什么别人有下载按钮我没有"。
+                                        append("\n（这条线路只查到版本号，安装包请到页面里下）")
+                                    }
+                                },
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                            if (state.notes.isNotBlank()) {
+                                Text(
+                                    text = state.notes.trim(),
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    maxLines = 6,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                )
+                            }
+                            // ★ 整行可点（L28：可点区要够大）
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onOpen(state) }
+                                    .padding(top = 6.dp, bottom = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = if (state.apkUrl != null) "去下载" else "打开 Release 页面",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                is com.chatmobile.update.UpdateCheck.UpToDate -> {
+                    Text(
+                        text = "已是最新版本（线上 ${state.latest}）。",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                is com.chatmobile.update.UpdateCheck.Failed -> {
+                    Text(
+                        text = state.reason,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    // ★★★ 最关键的一行：**没有梯子的人**也有路可走。
+                    //   只显示"检查失败"等于告诉他"你没梯子就别想更新了"。
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenUrl(state.manualUrl) }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "手动打开更新页",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = !checking) { onCheck() }
+                .padding(vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (checking) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 1.5.dp,
+                )
+            }
+            Text(
+                text = when {
+                    checking -> "正在检查…"
+                    state is com.chatmobile.update.UpdateCheck.Failed -> "重试"
+                    else -> "检查更新"
+                },
+                fontSize = 13.sp,
+                color = if (checking) {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
+            )
+        }
+
+        // ★ 把"走的哪条线路"写出来。没有这一行，用户看到"查到了但没下载按钮"
+        //   或者"这次比上次少了一行"会以为是 bug。
+        if (channel != null && !checking) {
+            Text(
+                text = "更新信息来自：${channel.label}",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }

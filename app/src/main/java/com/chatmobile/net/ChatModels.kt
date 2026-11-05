@@ -41,6 +41,23 @@ data class ChatMessage(
     val toolCalls: List<ToolCallRequest> = emptyList(),
     /** 仅 `role == "tool"` 时非空，对应发起调用的 id。 */
     val toolCallId: String? = null,
+    /**
+     * 随这条消息一起发出的**图片**（只对 `role == "user"` 有意义）。
+     *
+     * ★★★ 一旦非空，`content` 在 JSON 里就**不能是字符串**，必须变成数组：
+     * ```json
+     * "content": [
+     *   {"type":"text","text":"这是什么"},
+     *   {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,…"}}
+     * ]
+     * ```
+     * 发成字符串 + 另加一个顶层字段是最常见的错误 —— 服务端会**静默忽略图片**，
+     * 模型回你一句"我看不到图片"，而报文本身完全合法。
+     *
+     * ★ 文本类附件**不在这里**：它们已经被内联进 [content] 正文了
+     *   （协议里没有 `{"type":"file"}` 这种类型）。
+     */
+    val images: List<ChatAttachment> = emptyList(),
 ) {
     companion object {
         const val ROLE_SYSTEM: String = "system"
@@ -50,7 +67,8 @@ data class ChatMessage(
 
         fun system(content: String): ChatMessage = ChatMessage(ROLE_SYSTEM, content)
 
-        fun user(content: String): ChatMessage = ChatMessage(ROLE_USER, content)
+        fun user(content: String, images: List<ChatAttachment> = emptyList()): ChatMessage =
+            ChatMessage(ROLE_USER, content, images = images)
 
         fun assistant(content: String, reasoning: String? = null): ChatMessage =
             ChatMessage(ROLE_ASSISTANT, content, reasoning)

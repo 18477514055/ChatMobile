@@ -6,6 +6,12 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+    // ★★★ 必须声明：`@Serializable` 的序列化器是**编译期生成的**。
+    //   只在根 build.gradle.kts 里写 `apply false`（那只是声明版本、不启用）
+    //   ⇒ 编译能过（注解是普通的），但运行时会抛：
+    //     `Serializer for class 'MessageAttachmentMeta' is not found.`
+    //   ★ 这是「编译绿、真机崩」的典型：注解存在、插件没跑，两者都不报错。
+    id("org.jetbrains.kotlin.plugin.serialization")
     id("com.google.devtools.ksp")
 }
 
@@ -103,6 +109,11 @@ android {
 
     buildFeatures {
         compose = true
+        // ★ 必须显式打开：AGP 8 起 BuildConfig 默认不生成。
+        //   不打开的话 `BuildConfig.VERSION_NAME` 会 Unresolved reference，
+        //   而报错信息完全没提这个开关 —— 会让人以为是自己写错了包名。
+        //   「检查更新」需要当前版本号来跟 Release 的 tag 比对，所以必须有它。
+        buildConfig = true
     }
 
     // Robolectric 跑 Room 需要 Android resources，否则单元测试拿不到 Context

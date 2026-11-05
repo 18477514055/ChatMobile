@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 的可共享路径白名单。
+
+  ★ 只列**必须共享给相机**的那一个子目录，不要写 `<files-path path="." />`：
+    那个写法会把整个私有目录（数据库、记忆库、工作区）都暴露给任何
+    拿到 URI 授权的 App。相机只需要写它自己那张照片。
+
+  ★ `path="photos/"` 对应 `context.getExternalFilesDir(null)/photos/`
+    —— 见 ChatHost.launchTakePhoto()。
+
+  ★ 另外单独给 `shared/` 一个条目：那是用户从「＋」里选出来、
+    准备交给模型处理的文件。将来做"把文件分享出去"时用得上，
+    现在先预留着，但**仍然是独立子目录**，不是整个 filesDir。
+-->
+<paths>
+    <!-- 拍照产物：getExternalFilesDir(null)/photos/ -->
+    <external-files-path name="photos" path="photos/" />
+
+    <!-- 用户主动挑选、准备交给模型的文件：filesDir/shared/ -->
+    <files-path name="shared" path="shared/" />
+</paths>

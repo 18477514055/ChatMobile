@@ -18,6 +18,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -31,6 +32,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.chatmobile.markdown.MathAnnotator
 import com.chatmobile.markdown.MdAlign
 import com.chatmobile.markdown.MdBlock
 import com.chatmobile.markdown.MdInline
@@ -198,35 +200,87 @@ private fun MdBlockView(block: MdBlock, textColor: Color, bodySize: Int? = null)
         //     与代码块同一个理由
         //   - 字号跟正文一样（**不缩小**）：公式里全是符号，本来就比中文难认
         is MdBlock.MathBlock -> {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-            ) {
-                Box(modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                    Text(
-                        text = block.rendered.ifEmpty { block.tex },
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = (bodySize ?: 16).sp,
-                        lineHeight = ((bodySize ?: 16) * 1.6f).sp,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
-                }
-                // ★ 流式中没闭合要说明 —— 否则用户以为公式写到这就没了
-                if (!block.closed) {
-                    Text(
-                        text = "…",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                }
-            }
+            MathBlockView(block = block, bodySize = bodySize ?: 16)
         }
     }
 }
+
+/**
+ * 公式块 —— **真正的数学排版**（分式有横线、上下标真抬升、根号有上横线）。
+ *
+ * ## ★★★ 这一版为什么重写（用户原话）
+ *
+ * > 「我想让他的渲染更进一步，变成更加标准的样子。你看 ds 的客户端就可以渲染成这样，我们不行吗？」
+ *
+ * 上一版把 `\frac{AC}{AB}` 变成 `AC/AB`、`\int_a^b` 变成 `∫ₐᵇ` —— 能读，
+ * 但那是**把二维结构压成一维文本**，永远做不到「标准」：
+ * 分式没有横线、上下限不堆叠、根号罩不住内容。
+ *
+ * 现在走 [MathNode] 盒模型：解析成树 → 排版成多行 → 编成带样式的字符串。
+ *
+ * ## ★ 三个渲染约束（都是"一个 Text 搞定"的前提）
+ *
+ * 1. **必须等宽字体** —— 分式横线是用一串 `─` 铺出来的，比例字体下会断成虚线
+ * 2. **横向可滚** —— 长公式折行就没法读（与代码块同一个理由）
+ * 3. **字号不缩小** —— 公式里全是符号，本来就比中文难认
+ */
+@Composable
+private fun MathBlockView(
+    block: MdBlock.MathBlock,
+    bodySize: Int,
+) {
+    // ★ 只在 tex / 字号变化时重新解析+排版（滚动重组时不重复算）
+    val rendered = remember(block.tex, bodySize) {
+        runCatching {
+            MathAnnotator.render(block.tex, bodySize.toFloat())
+        }.getOrNull()
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            // ★ 带分式的公式上下更挤，多留一点内边距
+            .padding(
+                horizontal = 12.dp,
+                vertical = if (rendered?.hasFraction == true) 14.dp else 10.dp,
+            ),
+    ) {
+        Box(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+            if (rendered != null) {
+                Text(
+                    text = rendered.text,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = bodySize.sp,
+                    // ★ 行高按视觉行数动态给：分式是 3 行，行高不够会互相压住
+                    lineHeight = (bodySize * 1.35f).sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            } else {
+                // ★ 排版失败（不该发生，但必须兜底）：退回旧的可读文本，
+                //   绝不能让公式块变空白。
+                Text(
+                    text = block.rendered.ifEmpty { block.tex },
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = bodySize.sp,
+                    lineHeight = (bodySize * 1.6f).sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+        // ★ 流式中没闭合要说明 —— 否则用户以为公式写到这就没了
+        if (!block.closed) {
+            Text(
+                text = "…",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+    }
+}
+
 
 /** 让引用竖线随内容拉伸的工具不需要了 —— 见上面 Quote 分支的注释。 */
 

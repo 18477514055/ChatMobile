@@ -13,36 +13,48 @@ import kotlinx.coroutines.launch
 /**
  * 流式自动跟随（手感清单 #7 —— 报告点名的**第二高优先级**体感项）。
  *
+ * ## ★★★ 第四次报同一个 bug 后换的思路（必读）
+ *
+ * 前三版都在讨论「**要不要滚**」—— 加 `autoFollow` 判断、加 `isUserDragging`、
+ * 加 `userScrolledAway` 粘性标记。用户第四次仍然报「向上滑动还跟滚」。
+ *
+ * 结论：**问题不在判断条件，在判断的时机与载体。**
+ *
+ * 用户的真实操作是：
+ * ```
+ * 流式输出中 → 手指按住往上拖 → 松手 → 惯性继续滚 → 想停在某处看内容
+ * ```
+ * 而前三版的恢复条件都挂在「位置」上（`isAtBottom`）或「是否还按着」上。
+ * 这两个量在**流式输出期间都是不可靠的**：
+ * - 内容每帧在长 ⇒ `firstVisibleItemIndex` 会自己变回 0（因为 index 0 = 底部，
+ *   而新内容不断插入 index 0 位置）⇒ `isAtBottom` 频繁瞬间为 true
+ * - 惯性滚动期间手指已经抬起 ⇒ `isUserDragging` 已经是 false
+ *
+ * ⇒ 新策略：**只要用户在流式期间碰过这张列表，就彻底停止自动跟随**，
+ *   直到他明确表示"我要回到底部"（点按钮 或 自己滚到底部并松手）。
+ *   不再试图从位置反推意图 —— 位置在流式期间根本说明不了意图。
+ *
+ * 代价与取舍（明确写出来，免得以后有人觉得"太保守"又改回去）：
+ * - 用户可能只是轻轻碰了一下屏幕（没滚）也被判为"停止跟随"
+ *   ⇒ 但他再点一下「回到底部」就恢复了。**这个代价远小于"拽不回去"**。
+ * - 流式期间新内容不再自动出现在视野里
+ *   ⇒ 那正是用户要的效果：他在看历史时不想被拽走。
+ *
  * ## 官方依据
  *
- * `UI研究-交互手感.md` §4.3 从 `TextInputWrapper.js` 读出的机制：
+ * `UI研究-交互手感.md` §4.3 从 `TextInputWrapper.js` 读出：
+ * `onDragStart`（367759）暂停跟随，`onScrollEnd`（367771）恢复。
+ * ★ 官方那套是**网页输入框**的语义（内容不会每秒长几十行）；
+ * 聊天流式的场景比它苛刻得多，所以这里的策略比官方更保守。
  *
- * ```
- * 367140: checkForScrollEvent  resolveScrollViewHandler  computeIdealScrollY
- * doScrollToTextInput  doScrollBackToClamp
- * startListeningForScrolling  stopListeningForScrolling
- * 367759: onDragStart   367771: onScrollEnd
- * ```
- *
- * 报告 §4.3 的结论原文：
- * > **用户一旦自己开始滚（onDragStart），就暂停自动跟随**；滚停（onScrollEnd）再恢复。
- *
- * 报告还提到官方的滚动回调分**三段**（§4.2，`ScrollViewHandler.js`）：
- * `onDragStart` / `onDragEnding` / `onDragEnd`，
- * 并明确建议：判断"恢复跟随"要挂在 **`DragEnding`**（松手、惯性还没停）而不是 `DragEnd`。
- *
- * ## ★★ reverseLayout 的坑（Lead 特别提醒过）
- *
- * 聊天列表用 `reverseLayout = true`（新消息在 index 0，视觉在底部），
- * 所以**判断"是否在底部"的逻辑要反过来**：
+ * ## ★★ reverseLayout 的坑
  *
  * | | 正序列表 | **reverseLayout = true（我们用这个）** |
  * |---|---|---|
  * | 视觉最底部 | `lastVisibleItemIndex == count-1` | **`firstVisibleItemIndex == 0`** |
  * | 用户往上翻 | index 变小 | **index 变大** |
- * | 滚到底部 | `scrollToItem(count-1)` | **`scrollToItem(0)`** |
  *
- * 所以本文件的判据一律用 **index 0 = 底部**，不要按正序逻辑写。
+ * 所以本文件的判据一律用 **index 0 = 底部**。
  */
 @Stable
 class AutoFollowState(
@@ -53,193 +65,215 @@ class AutoFollowState(
      * 是否跟随最新内容。
      *
      * - `true`  → 新内容进来就滚到 index 0（底部）
-     * - `false` → 用户手动往上翻了，冻结当前位置，**不要**偷偷把他拽回去
+     * - `false` → 冻结当前位置，**不要**偷偷把用户拽回去
      */
     var autoFollow by mutableStateOf(true)
         private set
 
-    /**
-     * 用户是否正手指按在列表上。
-     *
-     * ★ 语义是「**用户正在主动滚动**」，不是"屏幕上有一根手指"。
-     *   这两者的区别是本轮 bug 的关键（见 [onDragStart]）。
-     */
+    /** 用户是否正手指按在列表上。 */
     var isUserDragging by mutableStateOf(false)
         private set
 
     /**
-     * 用户**主动往上翻过**（看过历史）。
+     * ★★★ **用户碰过这张列表** —— 本轮的真正修复点。
      *
-     * ★★★ 这是本轮修 bug 新增的**粘性标记**。
+     * 语义比 [userScrolledAway] 更宽松也更可靠：
+     * **只要手指在流式期间落下过一次，就置 true**，不看他滚了多少、滚到哪。
      *
-     *   为什么光有 [isUserDragging] 不够 —— 用户报的第二类现象：
-     *   > 「在输出过程中我向上滑动后整个页面依旧会跟着向下滚动」
+     * 为什么这样更可靠：
+     * - 不需要读 `firstVisibleItemIndex`（流式期间它自己会变，不可信）
+     * - 不需要判断"用户是不是真的在滚"（按住不动也算 —— 他想停住看）
+     * - 一旦置 true，**只有** [animateToBottom] 或 [onScrollStopped] 里
+     *   「他确实滚到了底部且手指已抬起」才清
      *
-     *   旧逻辑：松手时 `autoFollow = isAtBottom`。而流式期间内容在长，
-     *   列表可能**恰好还是贴底**（用户只推了一点点、或还没推完就又长回来了）
-     *   ⇒ `isAtBottom` 为 true ⇒ 跟随被重新打开 ⇒ 下一帧 `onContentGrew` 把他拽回去。
-     *
-     *   ⇒ 光看"松手时在哪"是不够的，必须记住"他主动离开过底部"这个**意图**。
-     *     一旦用户为了看历史而向上滚，就进入 [isUserDragging] 语义的"暂停态"，
-     *     **只有他主动点「回到底部」或自己滚回底部才恢复**，不因为内容增长而自动恢复。
+     * ★ 与 [userScrolledAway] 同时保留：后者表达"他确实离开过底部"（用于 UI
+     *   决定要不要显示「回到底部」按钮），前者表达"他碰过，别再动"（用于硬闸）。
      */
+    var userTouchedList by mutableStateOf(false)
+        private set
+
+    /** 用户**主动往上翻过**（看过历史）。用于决定是否显示「回到底部」按钮。 */
     var userScrolledAway by mutableStateOf(false)
         private set
 
     /**
-     * 判定"当前是否已在底部"。
+     * 本次"手指按下 → 抬起"之间**是否真的发生过滚动**。
      *
-     * ★ reverseLayout 语义：**index 0 才是底部**。
-     *   同时要求第一项已经完全露出来（offset == 0），否则是"滑了一半"。
+     * ★ 用来把「真的在翻」与「只是碰了一下屏幕」区分开：
+     *   前者必须在抬起后继续冻结，后者应当立刻恢复跟随 ——
+     *   否则用户随手点一下气泡（想复制文字）就会莫名其妙失去跟随，
+     *   那会被当成新 bug 报回来。
+     *
+     * ★ 判据用 `isScrollInProgress`（**事件**），不用 `firstVisibleItemIndex`（**位置**）——
+     *   位置在流式期间不可信，事件不会因为内容变长而自己翻转。
      */
+    private var scrolledThisTouch by mutableStateOf(false)
+
+    /** 判定"当前是否已在底部"。reverseLayout：index 0 + offset 0。 */
     val isAtBottom: Boolean
         get() = listState.firstVisibleItemIndex == 0 &&
             listState.firstVisibleItemScrollOffset == 0
 
     /**
-     * 用手指拖拽开始时调用 —— 立刻停止跟随（清单 #7 的「拖拽即停」）。
+     * 手指落到列表上 —— **立即、永久**停止自动跟随（直到用户明确要求恢复）。
      *
-     * ★★★ **本轮 bug 的第二个根因在这里**：这个函数被每一帧重复调用，
-     *   而它无条件 `autoFollow = false`。
-     *
-     *   于是发生了一件很微妙的事：用户往上滑 → 松手 → [onDragEnding] 按
-     *   `isAtBottom` 恢复跟随 → **但手指还没完全离开屏幕的下一帧又调到这里**
-     *   → `autoFollow` 再被置 false → 再松手 → 再恢复……
-     *   两个方向来回打，界面表现为"以恒定速度持续下移"。
-     *
-     *   ⇒ 改成：**只有真的在往"离开底部"的方向移动时**才认作 dragging。
-     *     单纯按住（比如正好按住不动）不该打断跟随。
+     * ★ 这就是本轮的核心改动：不再"判断用户是不是在滚"，
+     *   而是"他碰了，就别动了"。**宁可少滚，也不要拽他。**
      */
-    fun onDragStart() {
+    fun onTouchDown() {
         isUserDragging = true
+        userTouchedList = true
+        scrolledThisTouch = false
+        autoFollow = false
+        android.util.Log.i(TAG, "手指落下 ⇒ 冻结跟随")
     }
 
     /**
-     * 用户实际发生了"向上离开底部"的滚动。
+     * 手指抬起。
      *
-     * @param atBottom 当前是否仍在底部
+     * ★ 判据是「**这次按下期间到底有没有真的滚过**」（事件），不是「停在哪」（位置）：
+     * - 真的滚过 ⇒ 他要去读历史 ⇒ 保持冻结
+     * - 只是点了一下气泡（想复制文字）⇒ 立刻恢复跟随
      *
-     * ★ 这是把"意图"落地的唯一入口：只要用户离开了底部，就记 [userScrolledAway]。
-     *   恢复只能靠 [animateToBottom] 或他自己滚回底部（见 [onScrollStopped]）。
+     * 不加这一条，用户随手点一下消息就会永久失去跟随，
+     * 那会被当成一个新 bug 报回来。
+     */
+    fun onTouchUp() {
+        isUserDragging = false
+        if (!scrolledThisTouch) {
+            // 只是碰了一下，没挪动 ⇒ 撤销这次冻结
+            userTouchedList = false
+            if (!userScrolledAway) autoFollow = true
+            android.util.Log.i(TAG, "手指抬起（未滚动）⇒ 恢复跟随")
+        } else {
+            android.util.Log.i(TAG, "手指抬起（滚动过）⇒ 保持冻结")
+        }
+        scrolledThisTouch = false
+    }
+
+    /**
+     * 观察滚动位置（由 `snapshotFlow` 喂进来）。
+     *
+     * ★★★ 只在**手指确实按着**的时候才据此判定"用户要离开底部"。
+     * 为什么：流式输出时内容每帧变长，`firstVisibleItemIndex` 会在
+     * 「内容已长高、滚动还没跟上」的那一帧短暂不为 0 —— 旧写法在这里
+     * 就 `userScrolledAway = true; autoFollow = false`，等于**内容自己在把跟随关掉**。
+     * 那种误判不会表现为"不跟了"，而会在下一轮把状态搅乱。
+     *
+     * 手指没按着时的位置变化一律**不解释**：那可能是内容增长、可能是动画残余。
      */
     fun noteScrollPosition(atBottom: Boolean) {
-        if (!atBottom) {
-            userScrolledAway = true
-            autoFollow = false
+        if (atBottom) {
+            // 回到最底部 —— 清掉"离开过"的标记（是否恢复跟随由 [onTouchUp] / [onScrollStopped] 决定）
+            userScrolledAway = false
+            return
         }
+        // ★★ 这里放宽回"只要不是自己滚出来的位移就算数"，但加了一个前提：
+        //   `autoFollow` 已经关掉，或者手指正按着。
+        //
+        //   上一版只在 `isUserDragging` 时才记 —— 那削弱了一道兜底：
+        //   万一 `onTouchDown` 因为任何原因没被调用（手势没进来、事件被别的层吃掉），
+        //   整条冻结链路就完全失效，而表现恰好就是"滑动之后还跟滚"。
+        //   加上 `!autoFollow` 这个条件后：
+        //   - 内容增长造成的瞬时抖动：此时 autoFollow 仍是 true、手指也没按 ⇒ **不算**（不误判）
+        //   - 用户真的滚了：`onTouchDown` 已把 autoFollow 置 false ⇒ **一定算**（兜底生效）
+        if (!isUserDragging && autoFollow) return
+        userScrolledAway = true
+        scrolledThisTouch = true
+        autoFollow = false
     }
 
     /**
-     * 松手时调用，等价官方的 `onDragEnding`。
+     * 滚动停止时调用。
      *
-     * ★ 与旧版的关键差别：**不再用 `isAtBottom` 无条件恢复跟随**。
-     *   流式期间内容在长，`isAtBottom` 随时可能瞬间为 true，
-     *   用它当恢复条件等于"用户永远拽不回去"。
+     * ★★★ **不再按位置自动恢复跟随**（这是第五次报同一个 bug 后的改动）。
      *
-     *   ⇒ 恢复跟随只有两种情况：
-     *     ① 用户自己滚回了底部（由 [onScrollStopped] 判）
-     *     ② 用户点了「回到底部」（[animateToBottom]）
+     * 为什么删掉"在底部就恢复"：流式期间内容是**连续增长**的，
+     * 只要某一帧位置恰好回到 0/0（布局重新测量、动画残余、甚至一次误触的
+     * 极小位移），`autoFollow` 就被悄悄打开，下一帧 `onContentGrew` 立刻把用户拽回去。
+     * 这条路**用户完全看不见**，却足以让"我明明滑上去了"反复发生。
+     *
+     * ⇒ 恢复跟随只留**两条用户显式意图**：
+     *   ① 发新消息（[onNewUserMessage]）
+     *   ② 点「回到底部」（[animateToBottom]）
+     *   这两条都是"用户明确说了要看最新"。
      */
-    fun onDragEnding() {
-        isUserDragging = false
-        // ★ 刻意**什么都不做**：不在这里恢复 autoFollow。
-        //   恢复交给 onScrollStopped（用户自己滚回去）或 animateToBottom（点按钮）。
-    }
-
-    /** 滚动停止时兜底校正一次（惯性滚动可能把用户带回底部）。 */
     fun onScrollStopped() {
-        val nowBottom = isAtBottom
-        if (nowBottom) {
-            // ★ 用户**自己滚回底部了** ⇒ 清掉粘性标记，恢复跟随。
-            //   注意：这里用 isUserDragging 判断"是不是他主动滚的"，
-            //   拖拽/惯性都没了才认。
-            if (!isUserDragging) {
-                userScrolledAway = false
-                autoFollow = true
-            }
-        } else {
-            noteScrollPosition(atBottom = false)
-        }
+        if (isUserDragging) return // 还在拖，别下结论
+        // ★ 刻意什么都不做：位置不参与"要不要恢复跟随"的决策。
+        //   保留这个函数是为了让调用点稳定（它是 `snapshotFlow { isScrollInProgress }` 的出口）。
     }
 
     /**
-     * 新内容到达时调用。只有 `autoFollow == true` 才滚。
+     * 用户**发出新消息**时调用 —— 这是一次显式的"我要看回答"。
      *
-     * ## ★★ 为什么用 `requestScrollToItem` 而不是 `scope.launch { scrollToItem(0) }`
+     * ★ 必须存在：否则用户在上一轮读历史时冻住了跟随，
+     *   下一轮回答了却永远不跟，看起来就像"发送后不自动滚到新消息"。
+     *   **每一条新消息都是重新表达一次意图**，不需要用户去点「回到底部」。
+     */
+    fun onNewUserMessage() {
+        userTouchedList = false
+        userScrolledAway = false
+        scrolledThisTouch = false
+        autoFollow = true
+    }
+
+    /**
+     * 新内容到达时调用。
      *
-     * 用户真机反馈原话：
-     * > 「行数先增加，然后在极短的时间内用户消息再上升，这就导致了视觉上的不同步。
-     * >  当然他们之后肯定会恢复过来。」
+     * ## ★★★ 第五次之后，用户直接给了判据 —— 照做，不再自作聪明
      *
-     * **「之后会恢复」+「先…然后…」= 典型的晚 1~2 帧。**
+     * 用户原话：
+     * > 「滚动问题还在，反正我的想法是能不能这样，**除非在最底部，否则绝对不随之滚动**」
      *
-     * 旧写法的延迟链（三段叠加）：
+     * 这句话把判据压到**一条**：`isAtBottom`。
      *
-     * | # | 环节 | 代价 |
+     * ## 为什么前面四版都绕远了（值得记下来，免得再绕）
+     *
+     * | 版本 | 我加的判据 | 用户看到的 |
      * |---|---|---|
-     * | 1 | 文本增长 → 触发重组 | 本帧 |
-     * | 2 | `LaunchedEffect` 在**组合完成之后**才跑 | +1 阶段 |
-     * | 3 | `scope.launch` 再排一次队 | +1 帧 |
-     * | 4 | `scrollToItem` 是 **suspend**，还要再等一次 | +1 帧 |
+     * | ① | `!autoFollow` | 还跟滚 |
+     * | ② | `isUserDragging` | 还跟滚 |
+     * | ③ | `userScrolledAway` 粘性 | 还跟滚 |
+     * | ④ | `userTouchedList`（碰过就停） | 还跟滚（且轻点一下就永久不跟） |
+     * | **⑤** | **`isAtBottom`：不在底部就**绝不**滚** | —— |
      *
-     * ⇒ 内容在第 N 帧长高，滚动在第 N+1/N+2 帧才到位。中间这段就是"错位"。
+     * 我一直在加"额外的粘性标记"，而用户要的是**最朴素的那条**：
+     * 只要现在不在底部，就别动。
      *
-     * **`requestScrollToItem(int, int)` 是非 suspend 的**
-     * （已用 `javap` 核实签名：
-     * `public final void requestScrollToItem(int, int)` +
-     * `requestScrollToItem$default(...)` 默认 offset=0）。
+     * 之前我不敢只用 `isAtBottom`，理由是"流式期间它会自己变回 true"。
+     * 那个担心**只在"我主动滚到底"时成立** —— 而现在改成：
+     * 不主动滚，只检查。检查时的 `isAtBottom` 反映的是**用户此刻的真实位置**，
+     * 这恰恰就是用户要的语义。
      *
-     * 它把目标写进内部 `MutableState`，在**下一帧 measure 之前**被消费 ——
-     * 不经过协程调度，因此与内容增长**同帧**生效。
+     * ## 明确的代价（写出来，免得以后又有人"优化"）
      *
-     * ## 为什么不用 `animateScrollToItem`
-     *
-     * 流式追加时每个 token 都触发一次，动画会互相打断、产生抖动感。
-     * 报告 §7.1 的 600ms `animateScrollTo` 是给**用户主动跳转**用的
-     * （见 [animateToBottom]），不是给流式追帧用的。
+     * 用户往上翻、但尚未离开到底部那一小段（offset 1~几 px）时，仍会被跟随。
+     * 这是 `isAtBottom` 的定义决定的，也正是用户说的"在最底部"。
+     * 一旦离开底部（哪怕只差一行），就再也不动 —— 直到他自己回去或点按钮。
      */
     fun onContentGrew() {
-        // ★★★ 用户在拖拽期间，**无论 autoFollow 是什么都绝不滚动**。
-        //
-        //   用户真机反馈原话（**两次**）：
-        //   > 「因为流式输出的存在，导致在输出的过程中往上滑，它会自动继续往下滑，
-        //   >  结果不会回到底部。但是呢依旧会以同样的速度往下滑，
-        //   >  导致我无法定位到上面的一个固定位置。」
-        //   > （第二次）「在输出过程中我向上滑动后整个页面依旧会跟着向下滚动」
-        //
-        //   现象拆解：**手指还按着**（拖拽中），内容仍在长（流式），
-        //   容器于是继续被"跟随"逻辑往下拉 —— 但用户的拖动也在同时施加位移，
-        //   两个力打架 ⇒ 位置以恒定速度漂移，用户根本定不住。
-        //
-        //   ## 为什么前两次修都没修好（这是本轮必须讲清的事）
-        //
-        //   | 次数 | 当时的防线 | 为什么不够 |
-        //   |---|---|---|
-        //   | ① | `if (!autoFollow) return` | `onDragEnding` 会用 `isAtBottom` 重算，瞬间又打开 |
-        //   | ② | `if (isUserDragging) return` | `onDragStart` **每帧都在调**且无条件置 `autoFollow=false`；松手时又被 `isAtBottom` 拉回 true ⇒ 来回打 |
-        //   | ③（本轮） | `isUserDragging` 硬闸 + **`userScrolledAway` 粘性标记** | 恢复跟随不再由"当前位置"决定，而由"用户意图"决定 |
-        //
-        //   ⇒ 三道闸：
-        //     ① 手指按着 ⇒ 绝不动
-        //     ② 用户主动离开过底部 ⇒ 绝不动（**除非**他滚回去或点按钮）
-        //     ③ 已经在底部 ⇒ 无需动
+        // ★ 唯一判据：在底部才滚，不在底部绝对不滚。
+        if (!isAtBottom) return
+        // 手指按着时也不滚（他自己在拖，插一脚只会打架）
         if (isUserDragging) return
-        if (userScrolledAway) return
-        if (!autoFollow) return
-        if (isAtBottom) return // 已经在底部，无需再滚
-        // ★ 非 suspend：目标写进 MutableState，下一帧 measure 前生效。
-        //   reverseLayout 下 index 0 = 视觉底部。
         listState.requestScrollToItem(0)
+        // ★ 诊断：这行的次数 = 流式期间真的滚了几次。
+        //   用户再报"还跟滚"时先看它：还在刷 ⇒ 另有滚动源；没刷 ⇒ 动的是位移动画。
+        android.util.Log.i(TAG, "自动滚到底（在底部 + 内容增长）")
+    }
+
+    private companion object {
+        const val TAG = "AutoFollow"
     }
 
     /**
-     * 用户主动点"回到最新"时调用 —— 这个才用 600ms 动画
-     * （[实测] `ValdiScrollView.java:751` `startScroll(..., 600)`）。
+     * 用户主动点"回到最新"时调用 —— **唯一**一条会无条件恢复跟随的路径。
      *
-     * ★ 同时**清掉粘性标记** —— 这是唯一一条用户显式表达"我要回到最新"的路径，
-     *   不清的话点了按钮也不会恢复跟随。
+     * ★ 三个标记一起清：这是用户显式表达"我要回到最新"。
      */
     fun animateToBottom() {
+        userTouchedList = false
         userScrolledAway = false
         autoFollow = true
         scope.launch {

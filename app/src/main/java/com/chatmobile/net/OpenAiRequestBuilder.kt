@@ -3,6 +3,7 @@ package com.chatmobile.net
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
@@ -39,10 +40,22 @@ internal object OpenAiRequestBuilder {
                 add(
                     buildJsonObject {
                         put("role", m.role)
-                        // ★ 带 tool_calls 的 assistant 消息，content 可以是空串 ——
-                        //   协议允许，但个别网关对「content 缺失」比「content 为空串」更挑剔，
-                        //   所以一律显式写空串。
-                        put("content", m.content)
+                        // ★★★ content 的**形状**由"有没有图片"决定，不能一律写字符串。
+                        //
+                        //   有图片 ⇒ 必须是数组 `[{type:text},{type:image_url}]`；
+                        //   没有 ⇒ 字符串（绝大多数消息走这条，保持与旧版逐字节一致，
+                        //   前缀缓存不受影响）。
+                        //
+                        //   ★ 如果统一写成数组，纯文本消息的报文会和旧版不同
+                        //     ⇒ 整段历史前缀失效。所以这里必须**分支**，不是"统一改掉"。
+                        if (m.images.isEmpty()) {
+                            // ★ 带 tool_calls 的 assistant 消息，content 可以是空串 ——
+                            //   协议允许，但个别网关对「content 缺失」比「content 为空串」更挑剔，
+                            //   所以一律显式写空串。
+                            put("content", m.content)
+                        } else {
+                            put("content", buildContentParts(m))
+                        }
                         // DeepSeek：带 tools 时才需要回传 reasoning，不带 tools 时传了也会被忽略。
                         // 默认不回传，避免给不认识的网关塞非标字段。
                         if (config.echoReasoning && m.reasoning != null) {
@@ -109,6 +122,40 @@ internal object OpenAiRequestBuilder {
             if (k !in PROTECTED_KEYS) put(k, v)
         }
     }
+
+    /**
+     * 把「正文 + 图片」编成 OpenAI 多模态的 `content` 数组。
+     *
+     * ★ 顺序固定为 **文字在前、图片在后**。
+     *   反过来的话，有些模型（实测 Qwen-VL 系）会先描述图片再回答问题，
+     *   把用户真正的问题淹没掉。文字在前符合"先问后看图"的直觉。
+     *
+     * ★ 文字为空时**仍然要发**一个 text 片段（发空串）：
+     *   只发图片数组的请求被个别网关判为非法（`content` 数组不能只有非 text 元素）。
+     *
+     * ★ 每张图都带自己真实的 MIME —— 相机来的 jpg 与相册透传的 png 不能混用
+     *   同一个前缀，否则服务端可能按错误的解码器解析。
+     */
+    private fun buildContentParts(m: ChatMessage): kotlinx.serialization.json.JsonArray =
+        kotlinx.serialization.json.buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "text")
+                    put("text", m.content)
+                },
+            )
+            for (img in m.images) {
+                val b64 = img.imageBase64 ?: continue
+                add(
+                    buildJsonObject {
+                        put("type", "image_url")
+                        putJsonObject("image_url") {
+                            put("url", "data:" + img.mimeType + ";base64," + b64)
+                        }
+                    },
+                )
+            }
+        }
 
     /**
      * 把调用方给的 tools 字符串解析成 JSON 树。

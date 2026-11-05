@@ -21,9 +21,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -40,6 +43,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.chatmobile.markdown.MarkdownParser
 import com.chatmobile.ui.markdown.MarkdownText
 import kotlinx.coroutines.delay
@@ -193,25 +197,73 @@ fun MessageBubble(
  */
 @Composable
 private fun UserBubble(message: ChatMessage, bodyFontSize: Int = 16) {
-    Row(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End,
+        horizontalAlignment = Alignment.End,
     ) {
-        // ★ 用户消息也走 Markdown 渲染 —— 用户经常粘贴代码 / 列表 / 链接。
-        //   但**不渲染标题**那种大字号：用户气泡里的 `#` 更可能是手滑，
-        //   保持和 AI 消息同一套解析即可（视觉上标题会被字号差区分开）。
-        Box(
-            modifier = Modifier
-                .widthIn(max = 300.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-        ) {
-            MarkdownText(
-                blocks = remember(message.text) { MarkdownParser.parse(message.text) },
-                textColor = MaterialTheme.colorScheme.onSurface,
-                bodySize = bodyFontSize,
-            )
+        // ★ 附件标签放在气泡**上方**：一眼看出"这条消息带了东西"。
+        //   而正文仍然是用户自己打的字 —— 附件内容不混进气泡正文，
+        //   否则会让人以为那些字是自己打的。
+        if (message.attachments.isNotEmpty()) {
+            SentAttachmentTags(message.attachments)
+        }
+        if (message.text.isNotBlank()) {
+            // ★ 用户消息也走 Markdown 渲染 —— 用户经常粘贴代码 / 列表 / 链接。
+            //   但**不渲染标题**那种大字号：用户气泡里的 `#` 更可能是手滑，
+            //   保持和 AI 消息同一套解析即可（视觉上标题会被字号差区分开）。
+            Box(
+                modifier = Modifier
+                    .widthIn(max = 300.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
+                MarkdownText(
+                    blocks = remember(message.text) { MarkdownParser.parse(message.text) },
+                    textColor = MaterialTheme.colorScheme.onSurface,
+                    bodySize = bodyFontSize,
+                )
+            }
+        }
+    }
+}
+
+/** 已发送消息上的附件标签（只读，不可删）。 */
+@Composable
+private fun SentAttachmentTags(items: List<com.chatmobile.data.MessageAttachmentMeta>) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.End),
+    ) {
+        for (meta in items) {
+            val isImage = meta.kind == com.chatmobile.data.MessageAttachmentMeta.KIND_IMAGE
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = if (isImage) Icons.Filled.Image else Icons.Filled.InsertDriveFile,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(12.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = meta.name,
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 120.dp),
+                    )
+                }
+            }
         }
     }
 }

@@ -100,6 +100,23 @@ fun ChatScreen(
     reasoningAutoCollapse: Boolean = true,
     /** 正文与列表的正文字号（sp，来自设置）。 */
     bodyFontSize: Int = 16,
+    /** 「＋」→ 添加图片（相册） */
+    onPickImage: () -> Unit = {},
+    /** 「＋」→ 添加文件（文件管理器 / App 私有目录） */
+    onPickFile: () -> Unit = {},
+    /** 「＋」→ 拍照（相机） */
+    onTakePhoto: () -> Unit = {},
+    /**
+     * 已选中、待随下一条消息发出的附件。
+     *
+     * ★ 这是"附件真的能发出去"的可见证据：用户选完立刻看到条目，
+     *   点发送后条目清空、消息气泡上出现同名标签。
+     *   上一版没有这个状态 —— 选完只往输入框写一行字，
+     *   看着像成了，实际一个字节都不会发（用户报的 bug）。
+     */
+    pendingAttachments: List<com.chatmobile.data.MessageAttachmentMeta> = emptyList(),
+    /** 移除某个待发附件（点条目上的 ×）。 */
+    onRemoveAttachment: (Int) -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val autoFollow = rememberAutoFollowState(listState)
@@ -220,24 +237,27 @@ fun ChatScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     // ★ 拖拽即停：Initial 阶段最早拿到手指落下事件
+                    //
+                    // ★★ 只在**状态翻转**时调 AutoFollow，不要每个 move 事件都调。
+                    //   手指按住不放时系统每帧都发 PointerEvent，旧写法每一帧都会
+                    //   重新调一次「开始拖拽」，把状态反复刷成同一个值 —— 幂等但白忙，
+                    //   而且松手那帧的判断很容易被后到的 move 事件盖掉。
                     .pointerInput(Unit) {
                         awaitPointerEventScope {
+                            var wasDown = false
                             while (true) {
                                 val event = awaitPointerEvent(PointerEventPass.Initial)
-                                val down = event.changes.any { it.pressed }
-                                if (down) {
-                                    // 手指一落下就停止跟随 —— 不确定用户是要滚还是要看
-                                    autoFollow.onDragStart()
+                                val anyDown = event.changes.any { it.pressed }
+                                if (anyDown && !wasDown) {
+                                    // 手指一落下就停止跟随 —— 不去猜他要滚还是要看
+                                    autoFollow.onTouchDown()
+                                } else if (!anyDown && wasDown) {
+                                    autoFollow.onTouchUp()
                                 }
-                                // 全部抬起 = 松手（官方 onDragEnding 语义）
-                                val anyStillPressed = event.changes.any { it.pressed }
-                                if (!anyStillPressed && event.changes.isNotEmpty()) {
-                                    autoFollow.onDragEnding()
-                                }
+                                wasDown = anyDown
                             }
                         }
-                    },
-            ) {
+                    },            ) {
                 // ★★ reverseLayout 只改变【绘制方向】（从底往上排），
                 //    **不会反转数据顺序**。所以必须自己喂倒序数据：
                 //      messages  = [msg1(最早), msg2, msg3(最新)]  ← 时间正序
@@ -295,7 +315,11 @@ fun ChatScreen(
             }
 
             // ---- 回到底部悬浮键（用户翻上去时出现）----
-            if (!autoFollow.autoFollow) {
+            //
+            // ★ 判据用 `userScrolledAway`（用户**真的拖动离开了底部**），
+            //   不用 `!autoFollow`：后者在"手指刚落下、还没挪动"的那一瞬也是 false，
+            //   会让这个键在每次轻点消息时闪一下。
+            if (autoFollow.userScrolledAway) {
                 GoToBottomButton(
                     onClick = { autoFollow.animateToBottom() },
                     modifier = Modifier
@@ -310,8 +334,19 @@ fun ChatScreen(
             value = input,
             onValueChange = onInputChange,
             isGenerating = isGenerating,
-            onSend = onSend,
+            // ★★ 发消息 = 明确表达"我要看回答" ⇒ 无条件恢复跟随。
+            //   不加这一条：用户在上一轮读历史时冻住了跟随，下一轮回答了却永远不跟，
+            //   看起来就是"发送后不自动滚到最新"，会被当成另一个 bug 报回来。
+            onSend = {
+                autoFollow.onNewUserMessage()
+                onSend()
+            },
             onStop = onStop,
+            onPickImage = onPickImage,
+            onPickFile = onPickFile,
+            onTakePhoto = onTakePhoto,
+            pendingAttachments = pendingAttachments,
+            onRemoveAttachment = onRemoveAttachment,
             modifier = Modifier
                 // ★ 用 ime.union(navigationBars)，不是单加 navigationBars 也不是两个都加。
                 //

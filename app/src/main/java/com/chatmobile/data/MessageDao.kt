@@ -235,6 +235,58 @@ interface MessageDao {
     suspend fun lastIn(conversationId: String): MessageEntity?
 
     // ---------------------------------------------------------------
+    // ★★★ 跨会话历史检索（给 `search_history` 工具用）
+    //
+    //   为什么放在 DAO 而不是把消息全读进内存再筛：
+    //   消息是**所有会话**的，几百条到几万条。全读进来再 filter 会让一次工具调用
+    //   吃掉几十 MB 内存并卡住主线程 —— 在手机上那是会真的掉的。
+    //   交给 SQLite 用 `LIKE` + 索引扫，只在命中时才把行取出来。
+    // ---------------------------------------------------------------
+
+    /**
+     * 跨会话按关键词搜消息正文。
+     *
+     * ★ **为什么要排掉当前会话**：模型已经在上下文里看到了当前会话的内容，
+     *   再搜出自己刚说过的话只是浪费 token。这个参数由调用方传。
+     *
+     * ★ `LIKE '%q%'` 用不上普通索引（前导通配），数据量大时会全表扫。
+     *   对"自带 SQLite、几万条消息上限"的手机客户端来说可以接受；
+     *   真到十万级再上 FTS5（Room 支持 `@Fts4`），那时是一次纯增量迁移。
+     *
+     * @param limit 上限，调用方钳制
+     */
+    @Query(
+        """
+        SELECT * FROM message
+        WHERE content LIKE '%' || :query || '%'
+          AND (:excludeConversationId IS NULL OR conversationId != :excludeConversationId)
+          AND role != 'system'
+        ORDER BY createdAt DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun searchAcrossConversations(
+        query: String,
+        excludeConversationId: String?,
+        limit: Int,
+    ): List<MessageEntity>
+
+    /**
+     * 会话里最近的若干条**用户消息** —— 用来回答"这个对话在干什么"。
+     *
+     * ★ 只取 user 角色：助手的长篇回答会把结果撑爆，而"做了什么"通常写在用户的诉求里。
+     */
+    @Query(
+        """
+        SELECT * FROM message
+        WHERE conversationId = :conversationId AND role = 'user'
+        ORDER BY seq DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun recentUserMessages(conversationId: String, limit: Int): List<MessageEntity>
+
+    // ---------------------------------------------------------------
     // 删除
     // ---------------------------------------------------------------
 

@@ -112,6 +112,12 @@ class ChatRepository(
         parentId: String? = null,
         id: String = idGenerator(),
         createdAt: Long = clock(),
+        /**
+         * 附件**元数据**（不含字节）。
+         *
+         * ★ 空列表会存成 NULL —— 见 `MessageAttachmentCodec.encode` 的注释。
+         */
+        attachments: List<MessageAttachmentMeta> = emptyList(),
     ): MessageEntity {
         val entity = MessageEntity(
             id = id,
@@ -122,6 +128,7 @@ class ChatRepository(
             status = status.value,
             createdAt = createdAt,
             parentId = parentId,
+            attachments = MessageAttachmentCodec.encode(attachments),
         )
         messages.insert(entity)
         conversations.touch(conversationId, clock())
@@ -194,6 +201,27 @@ class ChatRepository(
      * **App 启动时调一次。** 详见 [MessageDao.stopInFlight]。
      */
     suspend fun recoverInterruptedStreams(): Int = messages.stopInFlight()
+
+    // ---------------------------------------------------------------
+    // ★★★ 跨会话历史检索（`search_history` 工具的落地）
+    // ---------------------------------------------------------------
+
+    /**
+     * 按关键词跨会话搜消息。
+     *
+     * ★ **排除当前会话**：它已经在模型的上下文里了，再搜出自己刚说过的话
+     *   只是浪费 token，而且会让模型误以为"这是从历史里查到的"。
+     */
+    suspend fun searchMessagesAcross(
+        query: String,
+        excludeConversationId: String?,
+        limit: Int,
+    ): List<MessageEntity> =
+        messages.searchAcrossConversations(query, excludeConversationId, limit)
+
+    /** 某会话最近的若干条用户消息 —— 用来概括"这个对话在干什么"。 */
+    suspend fun recentUserMessages(conversationId: String, limit: Int): List<MessageEntity> =
+        messages.recentUserMessages(conversationId, limit)
 
     // ★ 这里刻意**不提供** "把 writer 的内存内容刷进库" 的方法。
     //   想立刻让库里有内容，就调 `writer.flush()` —— 那是缓冲器自己的职责，

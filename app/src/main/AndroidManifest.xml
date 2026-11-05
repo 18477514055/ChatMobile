@@ -55,6 +55,62 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
+    <!--
+      ★★★ 全盘文件访问（用户明确要求：「加一个访问所有文件的权限声明方便APP工作」）
+
+      这是 MANAGE_EXTERNAL_STORAGE —— Android 11 (API 30) 起引入的「所有文件访问权限」。
+      它**不是普通运行时权限**：用户在系统设置里单独授予（跳转到我们的专属设置页），
+      授予后 App 能读写共享存储里的任何文件。
+
+      ## 为什么这次加上了（之前是刻意不加的）
+
+      之前不加的理由写在上面那段里：它是 Play 的高危权限，要专门声明与审核。
+      但那是**分发渠道**的约束，不是**能力**的约束。而用户的真实需求是：
+      模型在工作区里干活时，能直接读到用户手机上的文件，而不是每次都让用户
+      先用 SAF 选一遍目录。对一个**自己装自己用**的客户端来说，这个前提下
+      全盘访问是合理的。
+
+      ## 必须如实说清的代价
+
+      1. **上 Google Play 会被拒**（或需要专门的「所有文件访问」声明与人工审核）。
+         只发 GitHub Release 不受影响。
+      2. **用户授予后，本 App 能读任意文件** —— 包括其它 App 的下载、照片、文档。
+         所以代码侧必须配上「工作区权限档位」这道闸（见 WorkspacePermission），
+         不能因为拿到了权限就对模型无限开放。
+      3. 系统仍会拦一部分位置：`/Android/data` 与 `/Android/obb`（其它 App 的私有目录）
+         在多数设备上依然不可见。这不是我们能绕的，也不是该绕的。
+
+      ## 声明了它，还要在界面上引导
+
+      这个权限**不会自动授予**。需要：
+      `Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION` 跳到本 App 的专属页。
+      ⇒ 设置页里会有一个「授予全盘访问」的入口（见 GeneralScreen）。
+
+      ★ 没有它时 App 完全正常工作 —— 只是文件工具只能碰工作区（私有目录 / SAF 暂存区）。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <!--
+      ★ 拍照 —— 输入框「＋」里的第三个入口。
+      ★ 只要 CAMERA；不声明 RECORD_AUDIO（不录音）。
+      ★ 用 take picture intent 时其实可以不声明 CAMERA（交给相机 App），
+        但一旦声明了，就必须在运行时申请 —— 否则 intent 会被系统拒绝。
+        这里选择声明 + 申请：因为我们要控制「拍完直接回填到对话」这条链路。
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!--
+      ★ 相册（Android 13+ / API 33+ 的分媒体权限）。
+      ★ 13 以下走上面那条 READ_EXTERNAL_STORAGE（maxSdkVersion=32）。
+      ★ 只要 IMAGES：本版只支持发图片，不碰视频与音频。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
+    <!--
+      ★ 拍照产物要写到哪：优先写 App 私有目录（`getExternalFilesDir`），那样不需要
+        任何存储权限。只有用户要求存到相册时才用 MediaStore —— 见附件处理的实现。
+    -->
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -73,6 +129,31 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          ★ 拍照用的 FileProvider —— 没有它 `ACTION_IMAGE_CAPTURE` 拿不到可写 URI。
+
+          ## 为什么必须走 FileProvider 而不是直接给 file:// 路径
+
+          Android 7.0 起**禁止**把 `file://` URI 通过 Intent 传给别的 App
+          （FileUriExposedException）。相机是"别的进程"，所以要给它一个
+          `content://` URI，由 FileProvider 代理授权。
+
+          ## 为什么只开一个 `photos/` 目录
+
+          `path` 限定在 `photos/` 而不是整个 `files-path`：
+          相机只需要写到这一个目录，**给它更少就是更安全**。
+          万一某天相机 App 有漏洞，它也读不到我们的数据库和记忆库。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

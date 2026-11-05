@@ -570,46 +570,163 @@ class ChatHostContractTest {
             "isUserDragging 判断必须在 requestScrollToItem 之前",
             dragIdx < scrollIdx,
         )
+    }
 
-        // ★★★ 本轮新增：粘性标记 userScrolledAway 也必须是硬闸。
-        //
-        //   用户第二次报同一个 bug：「在输出过程中我向上滑动后整个页面依旧会跟着向下滚动」。
-        //   前两版分别靠 `!autoFollow` 和 `isUserDragging`，**都不够**：
-        //   `onDragEnding` 会用 isAtBottom 重算，而流式期间内容在长、
-        //   isAtBottom 随时可能瞬间为 true ⇒ 跟随被重新打开。
-        //
-        //   ⇒ 必须有"用户主动离开过底部"这个**不因内容增长而撤销**的粘性标记。
+    /**
+     * 手指按下必须**立刻冻结跟随**，且冻结用一个"不靠位置"的粘性标记。
+     *
+     * ★★★ 这是第四次报同一个 bug 后确立的判据。
+     *   前三版分别靠 `!autoFollow` / `isUserDragging` / `userScrolledAway`，
+     *   **全部挂在"位置"或"是否还按着"上**，而这两个量在流式期间都不可信：
+     *   - `reverseLayout` 下新内容不断插入 index 0 位置 ⇒ `isAtBottom` 自己变 true
+     *   - 惯性滚动期间手指已抬起 ⇒ `isUserDragging` 也是 false
+     *
+     *   ⇒ 判据换成"他在流式期间碰过这张列表"（[userTouchedList]），
+     *     只认手指落下这件事本身，不猜位置、不猜速度。
+     */
+    @Test
+    fun `手指落下必须冻结跟随且判据不靠位置`() {
+        val f = File("src/main/java/com/chatmobile/ui/chat/AutoFollow.kt")
+        val src = stripComments(f.readText())
+        val body = extractFunctionFrom(src, "fun onTouchDown()")
+        assertTrue("找不到 onTouchDown()", body.isNotBlank())
+
         assertTrue(
-            "onContentGrew() 必须同时以 userScrolledAway 短路 —— " +
-                "只靠 isUserDragging 挡不住「松手瞬间 isAtBottom 为 true」这条路",
-            body.contains("userScrolledAway"),
+            "onTouchDown() 必须置位 userTouchedList —— " +
+                "这是唯一不依赖位置/速度的冻结判据",
+            body.contains("userTouchedList = true"),
         )
         assertTrue(
-            "userScrolledAway 判断也必须在 requestScrollToItem 之前",
-            body.indexOf("userScrolledAway") < scrollIdx,
+            "onTouchDown() 必须立刻把 autoFollow 关掉，不能等滚动事件",
+            body.contains("autoFollow = false"),
+        )
+        // ★ 反例守卫：不许在按下时去读位置来判断意图
+        assertFalse(
+            "onTouchDown() 里不能读 isAtBottom —— 流式期间它随时为 true，判断等于没判断",
+            body.contains("isAtBottom"),
         )
     }
 
     /**
-     * 松手时**不能**用 `isAtBottom` 无条件恢复跟随。
+     * ★★★ 第五次之后，判据由**用户直接指定**，这里只负责钉住它。
      *
-     * ★ 这是「向上滑之后依旧往下滚」的真正根因：
-     *   流式期间内容在长，`isAtBottom` 随时可能瞬间为 true，
-     *   用它当恢复条件 = 用户永远拽不回去。
+     * 用户原话：
+     * > 「滚动问题还在，反正我的想法是能不能这样，**除非在最底部，否则绝对不随之滚动**」
      *
-     *   恢复跟随只该有两种触发：用户自己滚回底部、或点「回到底部」。
+     * 判据压到**一条**：`isAtBottom`。
+     *
+     * ## 为什么前四版都绕远了（写在这里，免得再绕第五次）
+     *
+     * | 版本 | 我加的判据 | 结果 |
+     * |---|---|---|
+     * | ① | `!autoFollow` | 还跟滚 |
+     * | ② | `isUserDragging` | 还跟滚 |
+     * | ③ | `userScrolledAway` 粘性 | 还跟滚 |
+     * | ④ | `userTouchedList`（碰过就停） | 还跟滚，且轻点一下永久不跟 |
+     * | **⑤** | **不在底部就绝不滚** | —— |
+     *
+     * 我一直在加"额外的粘性标记"，而用户要的是最朴素那条。
+     * 之前不敢只用 `isAtBottom`，理由是"流式期间它会自己变回 true" ——
+     * 那个担心只在**我主动滚**时成立；现在改成**只检查、不主动滚**，
+     * 它反映的就是用户此刻的真实位置，正是要的语义。
+     */
+    @Test
+    fun `只有在底部才允许自动滚动`() {
+        val f = File("src/main/java/com/chatmobile/ui/chat/AutoFollow.kt")
+        val src = stripComments(f.readText())
+        val body = extractFunctionFrom(src, "fun onContentGrew()")
+        assertTrue("找不到 onContentGrew()", body.isNotBlank())
+
+        val scrollIdx = body.indexOf("requestScrollToItem")
+        assertTrue("onContentGrew() 里必须有 requestScrollToItem", scrollIdx >= 0)
+
+        // ★ 唯一判据必须真的在，且必须在滚动之前
+        val bottomIdx = body.indexOf("isAtBottom")
+        assertTrue(
+            "onContentGrew() 必须用 isAtBottom 作判据 —— " +
+                "用户原话「除非在最底部，否则绝对不随之滚动」",
+            bottomIdx >= 0,
+        )
+        assertTrue(
+            "isAtBottom 判断必须在 requestScrollToItem **之前** —— " +
+                "否则等于没判",
+            bottomIdx < scrollIdx,
+        )
+        // ★ 手指按着时不插一脚（他自己在拖，我们跟着动只会打架）
+        val dragIdx = body.indexOf("isUserDragging")
+        assertTrue("手指按着时也要让路", dragIdx >= 0)
+        assertTrue("isUserDragging 也必须在滚动之前", dragIdx < scrollIdx)
+    }
+
+    /**
+     * **不该再引入**第四版那套粘性标记来做判据。
+     *
+     * ★ 这是防回归：`userTouchedList` 之类的东西一旦重新变成
+     *   `onContentGrew` 的判据，就会退回"轻点一下永久不跟"。
+     *   它们可以留着用于 UI（显示「回到底部」按钮），但**不能决定滚不滚**。
+     */
+    @Test
+    fun `跟滚判据不得再用碰过列表的粘性标记`() {
+        val f = File("src/main/java/com/chatmobile/ui/chat/AutoFollow.kt")
+        val src = stripComments(f.readText())
+        val body = extractFunctionFrom(src, "fun onContentGrew()")
+        assertFalse(
+            "onContentGrew() 里不能再出现 userTouchedList / userScrolledAway —— " +
+                "那是第四版的判据，它的副作用是「轻点一下气泡就永久失去跟随」",
+            body.contains("userTouchedList") || body.contains("userScrolledAway"),
+        )
+    }
+
+    /**
+     * 松手**不得**凭位置恢复跟随（这条红线跨版本一直有效）。
+     *
+     * ★ 恢复只能来自「用户自己滚到底」或「点回到底部」。
+     *   不能在 `onTouchUp` 里读位置就重新打开 —— 那会让"往上翻"被瞬间撤销。
      */
     @Test
     fun `松手不得用当前位置恢复跟随`() {
         val f = File("src/main/java/com/chatmobile/ui/chat/AutoFollow.kt")
         val src = stripComments(f.readText())
-        val body = extractFunctionFrom(src, "fun onDragEnding()")
-        assertTrue("找不到 onDragEnding()", body.isNotBlank())
+        val body = extractFunctionFrom(src, "fun onTouchUp()")
+        assertTrue("找不到 onTouchUp()", body.isNotBlank())
 
         assertFalse(
-            "onDragEnding() 里不能出现 `autoFollow = isAtBottom` —— " +
-                "流式期间它随时为 true，会把用户刚推上去的视图又拽回来",
+            "onTouchUp() 里不能出现 `autoFollow = isAtBottom`",
             Regex("""autoFollow\s*=\s*isAtBottom""").containsMatchIn(body),
+        )
+        assertFalse(
+            "onTouchUp() 不能用 isAtBottom 判断",
+            body.contains("isAtBottom"),
+        )
+    }
+
+    /**
+     * ★★★ 发送新消息必须把跟随状态复位。
+     *
+     * 不加这条：用户在上一轮读历史时冻住了跟随，下一轮回答了却永远不跟，
+     * 表现成"发送后不自动滚到新消息" —— 会被当成另一个 bug 报回来。
+     */
+    @Test
+    fun `发送新消息必须复位跟随状态`() {
+        val f = File("src/main/java/com/chatmobile/ui/chat/AutoFollow.kt")
+        val src = stripComments(f.readText())
+        val body = extractFunctionFrom(src, "fun onNewUserMessage()")
+        assertTrue("找不到 onNewUserMessage()", body.isNotBlank())
+        assertTrue(
+            "onNewUserMessage() 必须把 userTouchedList 清掉",
+            body.contains("userTouchedList = false"),
+        )
+        assertTrue(
+            "onNewUserMessage() 必须重新打开 autoFollow",
+            body.contains("autoFollow = true"),
+        )
+
+        // 调用点也要钉：ChatScreen 的发送回调必须真的调它（L26：设置存了≠生效）
+        val screen = stripComments(File("src/main/java/com/chatmobile/ui/chat/ChatScreen.kt").readText())
+        assertTrue(
+            "ChatScreen 的 onSend 必须调用 autoFollow.onNewUserMessage() —— " +
+                "只定义不调用等于没做（L26）",
+            screen.contains("autoFollow.onNewUserMessage()"),
         )
     }
 
@@ -795,6 +912,133 @@ class ChatHostContractTest {
         val end = code.indexOf("\"\"\"", triple + 3)
         if (end < 0) return ""
         return code.substring(triple + 3, end)
+    }
+
+    /**
+     * ★★★ **工作区必须真的送到运行时事实** —— 真机上「workspace: none」的根因。
+     *
+     * 用户界面上绑了工作区，模型却一直说「运行时事实里写着 workspace: none，
+     * 这轮我一个目录都没挂上」，还反过来猜测是数据没写进去 / 没落到会话上。
+     *
+     * 真因：`RuntimeFacts.render` 早就支持 `workspace: WorkspaceInfo?` 并会渲染
+     * 路径与权限档位，但**送进提示词的调用点 `RuntimeFactsProvider.collect(context)`
+     * 压根没有接收工作区的形参**。无论用户在界面上怎么绑，模型永远看到 none。
+     *
+     * 这与「思考过程收不起来」是同一个形状 —— **机制都在，唯独连接不存在**。
+     * 所以这条测试**对调用点断言**，不对组件内部断言。
+     */
+    @Test
+    fun `工作区必须送到运行时事实（不能只存不传）`() {
+        val provider = File("src/main/java/com/chatmobile/prompt/RuntimeFactsProvider.kt")
+        val host = File("src/main/java/com/chatmobile/ChatHost.kt")
+        assertTrue(provider.exists() && host.exists())
+
+        val providerSrc = stripComments(provider.readText())
+        // ① provider 必须收工作区形参
+        //
+        // ★★ 这里的正则踩了两次坑，都记在这里免得下一个人重走：
+        //   1. 签名是**多行、具名参数分行写**的 ⇒ 必须 DOT_MATCHES_ALL；
+        //   2. 默认值里有 `System.currentTimeMillis()` —— 自带一对括号，
+        //      而 `[^)]*` 一碰到第一个 `)` 就停了 ⇒ 永远匹配不到后面的 workspace。
+        //   ⇒ 用「从 fun collect( 到 ): String 之间」这段区间判断，不猜括号。
+        val collectBlock = providerSrc
+            .substringAfter("fun collect(", "")
+            .substringBefore("): String")
+        assertTrue("取不到 collect 的签名段", collectBlock.isNotEmpty())
+        assertTrue(
+            "RuntimeFactsProvider.collect 必须接收 workspace 形参 —— " +
+                "没有它，render 里那个 workspace 参数永远不会被喂到（真机表现：模型永远看到 none）",
+            "workspace" in collectBlock,
+        )
+        // ② 必须把它转交给 render（不是收了却不用）
+        assertTrue(
+            "collect 必须把 workspace 传给 render",
+            Regex("""RuntimeFacts\.render\([^)]*workspace""", RegexOption.DOT_MATCHES_ALL)
+                .containsMatchIn(providerSrc),
+        )
+
+        val hostSrc = stripComments(host.readText())
+        // ③ 调用点必须真的传。截取「RuntimeFactsProvider.collect(」之后到下一个
+        //    `)` + 换行」之前那一段 —— 具名参数是分行写的，用 `[^)]*` 会踩同一个坑。
+        val collectCall = hostSrc
+            .substringAfter("RuntimeFactsProvider.collect(")
+            .substringBefore("\n            )")
+        assertTrue("取不到 ChatHost 里的 collect 调用", collectCall.isNotEmpty())
+        assertTrue(
+            "ChatHost 调 collect 时必须传 workspace（否则模型永远看到 none）",
+            "workspace" in collectCall,
+        )
+        // ④ 必须从当前会话查出来，而不是传一个常量
+        assertTrue(
+            "工作区信息必须按当前会话查出来（buildWorkspaceInfo）",
+            "buildWorkspaceInfo(" in hostSrc,
+        )
+    }
+
+    /**
+     * ★★★ **权限档位的字符串必须与提示词里的字面值逐字一致**。
+     *
+     * 提示词里写的是 `read-only` / `workspace-write` / `full-access`，并且明确交代
+     * 「你的档位去运行时事实那块读」。如果运行时事实里写的是中文标签（「仅可查看」），
+     * 模型拿到的是一个它在提示词里**从没见过**的词 —— 只能猜，猜错就是越权或不敢做。
+     */
+    @Test
+    fun `权限档位的提示词取值必须与 SystemPrompt 字面一致`() {
+        val prompt = stripComments(
+            File("src/main/java/com/chatmobile/prompt/SystemPrompt.kt").readText(),
+        )
+        val perm = File("src/main/java/com/chatmobile/workspace/WorkspacePermission.kt").readText()
+
+        for (v in listOf("read-only", "workspace-write", "full-access")) {
+            assertTrue(
+                "提示词里必须出现 `$v`（它是模型唯一能依赖的档位名）",
+                prompt.contains(v),
+            )
+            assertTrue(
+                "WorkspacePermission.promptValue 必须能产出 `$v`",
+                perm.contains("\"$v\""),
+            )
+        }
+    }
+
+    /**
+     * ★★ 侧边栏长按菜单必须接上真实的置顶/删除动作。
+     *
+     * 这条防的是"菜单画出来了但点了没反应"—— 本项目最常见的假完成形态。
+     */
+    @Test
+    fun `侧边栏长按菜单必须接上置顶与删除`() {
+        val panel = stripComments(
+            File("src/main/java/com/chatmobile/ui/sidebar/SidebarPanel.kt").readText(),
+        )
+        val host = stripComments(File("src/main/java/com/chatmobile/ChatHost.kt").readText())
+
+        assertTrue(
+            "会话行必须支持长按（combinedClickable 的 onLongClick）",
+            "onLongClick" in panel,
+        )
+        assertTrue(
+            "长按不能与普通点击抢事件 —— 必须用 combinedClickable 而不是叠两个 clickable",
+            "combinedClickable" in panel,
+        )
+        for (cb in listOf("onTogglePin", "onDeleteConversation")) {
+            assertTrue("SidebarPanel 必须有 $cb 参数", cb in panel)
+            assertTrue("ChatHost 必须真的传 $cb", "$cb =" in host)
+        }
+        // 删除是不可撤销的，必须有二次确认
+        assertTrue(
+            "删除会话必须有二次确认（消息随外键 CASCADE 一起没，不可撤销）",
+            "删除对话？" in panel,
+        )
+        // 置顶动作必须真的落库
+        assertTrue(
+            "置顶必须写库（repo.setPinned）",
+            "repo.setPinned" in host,
+        )
+        assertTrue(
+            "删除必须真的删库（repo.deleteConversation）",
+            "repo.deleteConversation" in host,
+        )
     }
 
     /**

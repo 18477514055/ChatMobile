@@ -8,6 +8,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -41,6 +42,7 @@ import com.chatmobile.settings.SettingsState
 import com.chatmobile.settings.SettingsStore
 import com.chatmobile.settings.TestResult
 import com.chatmobile.data.ChatRepository
+import com.chatmobile.data.MessageAttachmentCodec
 import com.chatmobile.data.MessageEntity
 import com.chatmobile.data.MessageRole
 import com.chatmobile.data.MessageStatus
@@ -58,6 +60,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -147,11 +152,76 @@ fun ChatHost(
      *
      * ★ 从 DataStore 读出来的**快照**，启动时载入一次、用户改动后回读。
      *   不每帧读：DataStore 是异步的，每帧读会让开关闪一下。
+     *
+     * ★ 现在是**三态**（常驻 / 按需 / 关闭），不再是布尔开关 ——
+     *   用户要求「可以选择哪些工具常驻上下文，哪些工具进行懒加载」。
      */
-    var toolEnabledMap by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    var toolModeMap by remember {
+        mutableStateOf<Map<String, chatmobile.tools.ToolMode>>(emptyMap())
+    }
 
     /** 工具结果回填上限（字符），同样来自 DataStore。 */
     var toolResultChars by remember { mutableStateOf(8000) }
+
+    // ---- MCP（P2）----
+    //
+    // ★★★ 两个实例都 remember：**探测客户端与工具注册表必须跨轮复用**。
+    //   注册表里有一份工具清单缓存（5 分钟）—— 每次重组都新建一个的话，
+    //   缓存永远是空的，于是每一轮对话都要重新探测所有 MCP 服务器。
+    val mcpProbe = remember { com.chatmobile.mcp.McpProbeClient() }
+    val mcpRegistry = remember { com.chatmobile.mcp.McpToolRegistry() }
+
+    /**
+     * **探测过什么** —— `mcp_save_draft` 的判据来源。
+     *
+     * ★★★ 为什么必须是宿主记，不能让模型说了算：
+     *   模型可以跳过 `mcp_probe`，直接调 `mcp_save_draft` 并声称
+     *   "服务器名 GitHub 官方、有 42 个工具"。若宿主不核对，用户在确认框里
+     *   看到的**全是模型编的** —— 而那个框正是他唯一做决定的依据。
+     *
+     * ★ 用 `mutableStateMapOf` 而不是普通 map：它是 Compose 里的状态，
+     *   普通 map 改了不会触发重组（虽然这里主要不在 UI 上读，但保持一致更安全）。
+     *   键是原始 url（`mcp_save_draft` 收到的就是它）。
+     */
+    val mcpProbedByUrl =
+        remember { mutableStateMapOf<String, com.chatmobile.mcp.McpProbeResult.Ok>() }
+
+    /**
+     * 设置页要展示的 MCP 状态（服务器列表 + 当轮探测到的工具）。
+     *
+     * ★ 为什么要单独两个 state 而不是在设置页里现读：
+     *   设置页是 Composable，不能直接调 suspend 的 `settings.mcpServers()`。
+     *   而探测是网络操作（几十毫秒到几秒），必须在这里异步做。
+     *
+     * ★ 探测失败时 `definitions` 会是空的，但 `servers` 仍有值 ——
+     *   界面据此显示"服务器在，但暂时探测不到工具"，而不是"没有服务器"。
+     */
+    var mcpServersForUi by remember {
+        mutableStateOf<List<com.chatmobile.mcp.McpServerConfig>>(emptyList())
+    }
+    var mcpDefsForUi by remember {
+        mutableStateOf<List<chatmobile.tools.ToolDefinition>>(emptyList())
+    }
+
+    // ---- 专用搜索服务（三级里的第二级）----
+    //
+    // ★ 三个 state 拆开存：设置页是两个独立输入框，回读时要按落库后的真实值刷新，
+    //   合成一个对象反而不好判断"哪一半变了"。
+    var searchEndpointText by remember { mutableStateOf("") }
+    var searchApiKeyText by remember { mutableStateOf("") }
+
+    /**
+     * 提示词模板（集合 + 当前选中）。
+     *
+     * ★ 为什么要一个 state 而不是每帧现读：设置页要渲染列表与选中态，
+     *   而 DataStore 是异步的 —— 每帧读会让单选按钮闪一下。
+     *
+     * ★ 它**同时**驱动两件事：设置页的显示、以及发送时注入哪一段
+     *   （发送走 `settings.effectivePromptText()`，是同一个真源）。
+     */
+    var promptTemplatesState by remember {
+        mutableStateOf(com.chatmobile.prompt.PromptTemplateSet())
+    }
 
     // 设置存储。DataStore 的实例是进程级（见 SettingsStore 文件末尾的 by preferencesDataStore），
     // 这里 remember 只是避免每帧重新包装一次。
@@ -174,7 +244,6 @@ fun ChatHost(
 
     // 首次进入时算一次包状态（只读文件系统，很便宜）
     LaunchedEffect(Unit) { refreshPackStatus() }
-
     /** 给向量模型做一次真实探针：成功返回「已就绪 · N 维」，失败也要说清会退回字面检索。 */
     suspend fun probeEmbedding(cfg: com.chatmobile.settings.MemoryModelConfig): String {
         // 内置轻量向量：不需要网络，也不需要下载，直接报维度。
@@ -366,6 +435,547 @@ fun ChatHost(
     /** 工作区文件系统的唯一入口。 */
     val workspaceFs = remember { com.chatmobile.workspace.WorkspaceFs(context) }
 
+    // ---- 工具确认（`requiresConfirmation` 的消费方）----
+    //
+    // ★★★ 为什么必须做：`write_file` 声明了 `requiresConfirmation = true`，
+    //   而在此之前**没有任何地方读这个字段** —— 那等于一张空头支票，
+    //   模型可以在用户毫不知情的情况下覆盖掉一个文件。本项目已经栽过一次
+    //   「设置项存了但没人读」（L26），这次不能再留同一个缺口。
+    //
+    // ★ 挂起而不是拒绝：模型已经停下来说"我要写这个文件"。
+    //   如果我们回一句 ERROR，它会以为自己越权了。正确做法是**问用户**，
+    //   用户点允许就继续执行，点拒绝就把拒绝理由喂回模型。
+    var pendingConfirm by remember {
+        mutableStateOf<com.chatmobile.tools.PendingToolConfirm?>(null)
+    }
+
+    // ---- 检查更新 ----
+    //
+    // ★ 状态放在这里而不是 GeneralScreen 内部：那个页面在切层时会被销毁重建，
+    //   状态跟着没了的话，用户点完检查、切出去再回来，结果就凭空消失了。
+    var updateState by remember {
+        mutableStateOf<com.chatmobile.update.UpdateCheck?>(null)
+    }
+    var checkingUpdate by remember { mutableStateOf(false) }
+    var updateChannel by remember {
+        mutableStateOf<com.chatmobile.update.UpdateChecker.Channel?>(null)
+    }
+
+    // ---- 全盘文件访问（MANAGE_EXTERNAL_STORAGE）----
+    //
+    // ★ 状态要**每次回到界面时重读**：用户去系统设置里授完权再切回来，
+    //   如果只在启动时读一次，界面会一直显示"未授予" —— 用户会以为没生效。
+    var allFilesAccessGranted by remember { mutableStateOf(false) }
+
+    /**
+     * 这台机器上「所有文件访问」设置页走哪条路 —— 见 [com.chatmobile.permission.AllFilesAccessGate]。
+     *
+     * ★★★ 必须**先探测**再决定给不给入口。真机（Redmi / MIUI / Android 16）上
+     *   这一整组设置页是被裁掉的：用户点「去授予全盘访问」什么都不发生，
+     *   而代码不报错 —— 这就是本项目的老毛病「按钮在，但那条路不通」。
+     *   探测不到就如实说"这台机器没有这个开关"，不留点了没反应的按钮。
+     */
+    var allFilesRoute by remember {
+        mutableStateOf(com.chatmobile.permission.AllFilesAccessGate.Route.Unavailable)
+    }
+
+    /** 探测两条系统设置页是否真的存在（`resolveActivity` 返回 null = 系统里没有对应页面）。 */
+    fun probeAllFilesRoutes() {
+        fun resolvable(action: String): Boolean = runCatching {
+            val i = android.content.Intent(action).apply {
+                if (action == com.chatmobile.permission.AllFilesAccessGate.ACTION_APP_PAGE) {
+                    // 专属页必须带包名，否则解析不到（某些 ROM 对无包名的同名 action 直接返回 null）
+                    data = android.net.Uri.parse("package:${context.packageName}")
+                }
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.packageManager.resolveActivity(i, 0) != null
+        }.getOrDefault(false)
+
+        allFilesRoute = com.chatmobile.permission.AllFilesAccessGate.decide(
+            hasAppPage = resolvable(com.chatmobile.permission.AllFilesAccessGate.ACTION_APP_PAGE),
+            hasListPage = resolvable(com.chatmobile.permission.AllFilesAccessGate.ACTION_LIST_PAGE),
+        )
+        Log.i("ChatHost", "全盘访问设置页探测：$allFilesRoute")
+    }
+
+    /** 重读全盘访问状态。API 30 以下没有这个概念，直接当 true（旧系统走 READ_EXTERNAL_STORAGE）。 */
+    fun refreshAllFilesAccess() {
+        allFilesAccessGranted = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            runCatching { android.os.Environment.isExternalStorageManager() }.getOrDefault(false)
+        } else {
+            true
+        }
+    }
+
+    // ★★★ 全盘访问状态必须在**每次回到前台**时重读。
+    //
+    //   用户是被我们送去系统设置页授权的，授完再切回来 ——
+    //   只在启动时读一次的话，界面会一直显示「未授予」，用户以为没生效。
+    //
+    //   ★ 位置必须在 `refreshAllFilesAccess` **之后**：Kotlin 的局部声明不提升，
+    //     写在前面会 Unresolved reference（本项目在 core-memory 上踩过同一个坑）。
+    androidx.lifecycle.compose.LifecycleEventEffect(
+        androidx.lifecycle.Lifecycle.Event.ON_RESUME,
+    ) {
+        refreshAllFilesAccess()
+        probeAllFilesRoutes()
+    }
+
+    // ---- MCP 状态加载（进工具设置页时）----
+    //
+    // ★ 为什么绑在 `layer == Tools` 上而不是启动时：
+    //   探测是**网络操作**（每个服务器一次往返）。启动时做会让冷启动变慢，
+    //   而绝大多数冷启动的用户根本不会进工具设置页。
+    //   进页面才探测 = 只在真的要看的时候付这个成本。
+    //
+    // ★ 进页面**必须重新探测**（而不是只用缓存）：用户来这里常常就是因为
+    //   "刚在服务器那边加了工具却没生效"。用缓存会让他看到旧的清单。
+    androidx.compose.runtime.LaunchedEffect(layer) {
+        if (layer == NavLayer.Tools) {
+            mcpServersForUi = runCatching { settings.mcpServers() }.getOrDefault(emptyList())
+            val live = mcpServersForUi.filter { it.enabled }
+            mcpRegistry.invalidate()          // 进页面 = 以服务端当前状态为准
+            mcpDefsForUi = withContext(Dispatchers.IO) {
+                runCatching {
+                    mcpRegistry.buildDefinitions(live) { mcpProbe.probe(it.url) }
+                }.getOrDefault(emptyList())
+            }
+            toolModeMap = runCatching { settings.toolModeMap(mcpDefsForUi) }
+                .getOrDefault(toolModeMap)
+        }
+    }
+
+    // ---- 附件三入口（用户要求：「＋」→ 图片 / 文件 / 拍照）----
+    //
+    // ★★★ 三者都用**系统 Intent**，不自建选择器：
+    //   1. 相册/文件管理器/相机是系统能力，自建必然做得更差；
+    //   2. 系统选择器天然带「只给这一次」的语义，我们**不需要**读全盘就能拿到那一个文件；
+    //   3. Android 13+ 的 Photo Picker 连 READ_MEDIA_IMAGES 都不需要。
+
+    /** 当前待处理的附件请求（区分三个入口的回调）。 */
+    var pendingAttach by remember { mutableStateOf<AttachKind?>(null) }
+
+    /**
+     * 已选中、**待随下一条消息发出**的附件（元数据）。
+     *
+     * ★★★ 这是"附件真的能发出去"的关键状态。上一版没有它 ——
+     *   选完只往输入框写了一行文件名，**没有任何地方保存过那个文件**
+     *   ⇒ 用户看着像选好了，实际什么都没发。用户报的
+     *   「现在无法正常上传照片和文件」就是这条。
+     *
+     * ★ 只存元数据不存字节：字节在发送那一刻才读（见 `attachments.AttachmentReader`）。
+     */
+    var pendingAttachments by remember {
+        mutableStateOf<List<com.chatmobile.data.MessageAttachmentMeta>>(emptyList())
+    }
+
+    /**
+     * 拍照产物的落地路径。
+     *
+     * ★ 写**自己的私有目录**（`getExternalFilesDir`），不是共享相册 ——
+     *   那样不需要任何存储权限。用户没要求把照片存进相册，我们就不替他存。
+     */
+    var pendingPhotoPath by remember { mutableStateOf<String?>(null) }
+
+    /**
+     * 三个入口共用的 launcher。
+     *
+     * ★★ 这里有个**循环依赖**要先解开，否则编译不过：
+     *   - launcher 的回调要调 `onAttachResult`
+     *   - 而 `launchPickImage` 等三个函数又要用 launcher
+     *
+     *   而 Kotlin 的局部声明**不提升**（前面的声明不能用后面的）。
+     *   ⇒ 先用一个可空的持有者在前面占位，函数里通过它调用，
+     *     真正的 launcher 在 `onAttachResult` 定义之后赋值。
+     *
+     *   ★ 不要试图写成一个 lateinit var —— Compose 的 remember 里
+     *     lateinit 不合法，而且重组时会重复赋值。用 `var xxx: T? = null` + `invoke`。
+     */
+    var attachLauncherHolder: androidx.activity.result.ActivityResultLauncher<android.content.Intent>? = null
+
+    /** 相册：Android 13+ 用 Photo Picker（无需权限），旧系统退到 GET_CONTENT。 */
+    fun launchPickImage() {
+        pendingAttach = AttachKind.Image
+        val intent = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            android.content.Intent(android.provider.MediaStore.ACTION_PICK_IMAGES)
+        } else {
+            android.content.Intent(android.content.Intent.ACTION_GET_CONTENT).apply {
+                type = "image/*"
+                addCategory(android.content.Intent.CATEGORY_OPENABLE)
+            }
+        }
+        runCatching { attachLauncherHolder?.launch(intent) }
+            .onFailure { Log.w("ChatHost", "打开相册失败", it) }
+    }
+
+    /**
+     * 文件：SAF 打开文档。
+     *
+     * ★ 用户说「文件管理器与 APP 的私有目录」—— SAF 打开后系统侧栏里
+     *   会列出各存储位置，我们的私有目录用 `EXTRA_INITIAL_URI` 指过去。
+     */
+    fun launchPickFile() {
+        pendingAttach = AttachKind.File
+        val intent = android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(android.content.Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        runCatching { attachLauncherHolder?.launch(intent) }
+            .onFailure { Log.w("ChatHost", "打开文件选择器失败", it) }
+    }
+
+    /** 拍照：写私有目录，避免任何存储权限。 */
+    fun launchTakePhoto() {
+        pendingAttach = AttachKind.Photo
+        val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "photos")
+            .apply { mkdirs() }
+        val file = File(dir, "photo_${System.currentTimeMillis()}.jpg")
+        pendingPhotoPath = file.absolutePath
+
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file,
+        )
+        val intent = android.content.Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE).apply {
+            putExtra(android.provider.MediaStore.EXTRA_OUTPUT, uri)
+            addFlags(android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        }
+        runCatching { attachLauncherHolder?.launch(intent) }
+            .onFailure { Log.w("ChatHost", "打开相机失败", it) }
+    }
+
+    /** 取显示文件名。`content://` 走 ContentResolver。 */
+    fun displayNameOf(u: android.net.Uri): String? = runCatching {
+        context.contentResolver.query(u, null, null, null, null)?.use { c ->
+            val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (i >= 0 && c.moveToFirst()) c.getString(i) else null
+        }
+    }.getOrNull()
+
+    /** 去掉文件名里的路径分隔符等不安全字符（我们自己拼路径时用）。 */
+    fun sanitizeName(raw: String): String =
+        raw.replace(Regex("[\\\\/:*?\"<>|\\u0000]"), "_").take(120).ifBlank { "file" }
+
+    /**
+     * 把相册/相机来的图片**复制进私有目录**。
+     *
+     * ★ 为什么不直接用 URI：见 [onAttachResult] 的①。
+     * ★ 为什么不复制到共享目录：那需要存储权限，而我们连
+     *   `MANAGE_EXTERNAL_STORAGE` 都不能保证拿到（MIUI 上入口藏得很深）。
+     */
+    fun importImageFromUri(u: android.net.Uri): com.chatmobile.data.MessageAttachmentMeta? {
+        val name = displayNameOf(u) ?: ("image_" + System.currentTimeMillis() + ".jpg")
+        val dir = File(context.filesDir, "attach").apply { mkdirs() }
+        // ★ 文件名要加时间戳前缀：相册里同名文件极多（截图文件名会重复）
+        val target = File(dir, System.currentTimeMillis().toString() + "_" + sanitizeName(name))
+        val bytes = runCatching {
+            context.contentResolver.openInputStream(u)?.use { it.readBytes() }
+        }.getOrNull() ?: return null
+        target.writeBytes(bytes)
+        return com.chatmobile.data.MessageAttachmentMeta(
+            kind = com.chatmobile.data.MessageAttachmentMeta.KIND_IMAGE,
+            name = name,
+            mimeType = context.contentResolver.getType(u) ?: "image/jpeg",
+            sizeBytes = bytes.size.toLong(),
+            source = target.absolutePath,
+        )
+    }
+
+    /**
+     * SAF 选中的文件 → 元数据。
+     *
+     * ★ 关键一步：`takePersistableUriPermission`。
+     *   `ACTION_OPEN_DOCUMENT` 返回的 URI **只有本次进程内有效**，
+     *   不申请持久权限的话，冷启动后 `openInputStream` 直接抛
+     *   `SecurityException`。这类"当时好好的、重启就坏"的问题最难查。
+     */
+    fun metaFromSafUri(u: android.net.Uri): com.chatmobile.data.MessageAttachmentMeta? {
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                u,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }.onFailure { Log.w("ChatHost", "申请持久读权限失败（可能不支持，不影响本次）", it) }
+
+        val name = displayNameOf(u) ?: (u.lastPathSegment ?: "文件")
+        val mime = context.contentResolver.getType(u) ?: ""
+        val kind = com.chatmobile.net.AttachmentPolicy.classify(name, mime)
+        val size = runCatching {
+            context.contentResolver.query(u, null, null, null, null)?.use { c ->
+                val i = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                if (i >= 0 && c.moveToFirst()) c.getLong(i) else 0L
+            }
+        }.getOrNull() ?: 0L
+
+        // ★★★ 只有**真的读不出内容**的才拒绝（老 Office / 压缩包 / 音视频）。
+        //
+        //   用户原话：「我经常上传其他格式的，比如 word、PPT、PDF 之类的」。
+        //   上一版这里用 isTextLike 判断，把 docx/pptx/xlsx/pdf 全拒了 ——
+        //   那是偷懒：这些格式都能在本地提取（Office 解 ZIP，PDF 抠文本或渲染成图）。
+        if (com.chatmobile.net.AttachmentPolicy.isUnreadable(name, mime)) {
+            Log.i("ChatHost", "拒绝读不出内容的文件：" + name + " (" + mime + ")")
+            return null
+        }
+
+        return com.chatmobile.data.MessageAttachmentMeta(
+            kind = if (kind == com.chatmobile.net.ChatAttachment.Kind.Image) {
+                com.chatmobile.data.MessageAttachmentMeta.KIND_IMAGE
+            } else {
+                com.chatmobile.data.MessageAttachmentMeta.KIND_FILE
+            },
+            name = name,
+            mimeType = mime,
+            sizeBytes = size,
+            source = u.toString(),
+        )
+    }
+
+    /**
+     * 附件返回后的统一处理 —— **把选中的东西真正存下来**，等下一条消息一起发。
+     *
+     * ## ★★★ 上一版这里是断的（用户报的 bug）
+     *
+     * 旧实现只往输入框写了一行「已选图片：xxx.jpg」，然后就没了 ——
+     * 既没有保存 URI，也没有保存路径，更没有把它挂到消息上。
+     * 用户看到"已选图片"以为成了，其实**一个字节都不会发出去**。
+     *
+     * 现在做三件事：
+     *   ① 图片：**复制进我们自己的私有目录**（`files/attach/`）
+     *      —— 相册给的 `content://` 权限是临时的，下次冷启动就读不到；
+     *      而我们的设计是"落库只存元数据、发送时才读字节"，
+     *      存一个下次读不到的 URI 等于把图片弄丢。
+     *   ② 文件：保留 SAF 的 `content://` URI，并**申请持久读权限**
+     *      —— 这类文件可能有几十 MB，复制一份纯属浪费，而 SAF 的持久权限
+     *      正好能让冷启动后仍然可读。
+     *   ③ 结果进 `pendingAttachments`（输入框上方的附件条），**不写进输入框** ——
+     *      写进去会被当成用户说的话拼进正文。
+     */
+    fun onAttachResult(kind: AttachKind?, ok: Boolean, uri: android.net.Uri?) {
+        if (!ok) {
+            pendingAttach = null
+            pendingPhotoPath = null
+            return
+        }
+        val meta = try {
+            when (kind) {
+                AttachKind.Photo -> pendingPhotoPath?.let { path ->
+                    val f = File(path)
+                    val name = f.name
+                    com.chatmobile.data.MessageAttachmentMeta(
+                        kind = com.chatmobile.data.MessageAttachmentMeta.KIND_IMAGE,
+                        name = name,
+                        mimeType = "image/jpeg",
+                        sizeBytes = if (f.exists()) f.length() else 0L,
+                        source = path,
+                    )
+                }
+                AttachKind.Image -> uri?.let { u -> importImageFromUri(u) }
+                AttachKind.File -> uri?.let { u -> metaFromSafUri(u) }
+                null -> null
+            }
+        } catch (e: Throwable) {
+            Log.w("ChatHost", "处理附件失败", e)
+            null
+        } finally {
+            pendingAttach = null
+            pendingPhotoPath = null
+        }
+
+        if (meta == null) {
+            Log.w("ChatHost", "附件没有拿到可用的元数据（kind=$kind）")
+            return
+        }
+        pendingAttachments = pendingAttachments + meta
+        // ★ 输入框里只放名字，不放"已选"这种假状态 —— 真状态由附件条显示。
+        input = if (input.isBlank()) "" else input
+    }
+
+    // ★ 三个入口共用一个 launcher，靠 pendingAttach 区分。
+    //   必须声明在 `onAttachResult` 之后（Kotlin 局部声明不提升）。
+    val attachLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        onAttachResult(
+            kind = pendingAttach,
+            ok = result.resultCode == android.app.Activity.RESULT_OK,
+            uri = result.data?.data,
+        )
+    }
+    // ★ 把真身交给前面那个占位持有者 —— 三个 launch 函数通过它调用。
+    attachLauncherHolder = attachLauncher
+
+    /**
+     * 用系统浏览器打开一个外链。
+     *
+     * ★ 为什么包 runCatching 而不是直接 startActivity：
+     *   有些设备/模拟器上没有任何浏览器能处理 ACTION_VIEW，会抛
+     *   ActivityNotFoundException。那个异常会让整个 Compose 组合崩掉，
+     *   用户看到的是"点了检查更新，App 关了"。
+     */
+    fun openExternalUrl(url: String) {
+        runCatching {
+            context.startActivity(
+                android.content.Intent(
+                    android.content.Intent.ACTION_VIEW,
+                    android.net.Uri.parse(url),
+                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }.onFailure {
+            Log.w("ChatHost", "打开外链失败：$url", it)
+        }
+    }
+
+    /**
+     * 等到用户对一个需要确认的工具调用做决定。
+     *
+     * ★ 超时也回 false（拒绝）：没有人在看屏幕时**绝不能**默认放行 ——
+     *   那会让"确认框"退化成"3 秒后自动执行"。
+     */
+    suspend fun awaitToolConfirm(
+        req: com.chatmobile.tools.PendingToolConfirm,
+    ): Boolean {
+        pendingConfirm = req
+        return try {
+            withTimeoutOrNull(TOOL_CONFIRM_TIMEOUT_MS) {
+                req.decision.await()
+            } ?: false
+        } finally {
+            pendingConfirm = null
+        }
+    }
+
+    // ---- MCP 配置（P2）----
+    //
+    // ★★★ 四段式里的第 ③ 段：**起草 → 用户确认 → 保存**。
+    //
+    //   这里刻意**不**复用 `awaitToolConfirm`：那个框只问"允许吗"，
+    //   而 MCP 的确认框要展示**地址（脱敏）+ 工具数 + 这是模型提议的** ——
+    //   信息量完全不同，用通用框等于把用户做决定需要的依据藏起来。
+
+    /**
+     * `mcp_probe` 的实现 —— **纯只读**，不写任何状态。
+     *
+     * ★ 探测结果记进 [mcpProbed]：`mcp_save_draft` 会核对"这个地址真的探测过吗"。
+     *   不记的话，模型可以跳过 probe 直接起草一个"服务器名 + 工具数"全是虚构的配置。
+     */
+    suspend fun probeMcp(rawUrl: String): String {
+        val result = withContext(Dispatchers.IO) { mcpProbe.probe(rawUrl) }
+        return when (result) {
+            is com.chatmobile.mcp.McpProbeResult.Failed ->
+                "ERROR: ${result.reason}。${result.hint}"
+            is com.chatmobile.mcp.McpProbeResult.Ok -> {
+                // ★ 记下来，供 mcp_save_draft 核对（宿主记录，不是模型说了算）
+                mcpProbedByUrl[rawUrl] = result
+                buildString {
+                    append("探测成功。\n")
+                    append("服务器名：").append(result.serverName).append('\n')
+                    result.serverVersion?.let { append("版本：").append(it).append('\n') }
+                    append("传输：").append(result.transport).append('\n')
+                    append("工具数：").append(result.tools.size).append('\n')
+                    if (result.tools.isNotEmpty()) {
+                        append("\n工具清单：\n")
+                        for (t in result.tools.take(30)) {
+                            append("- ").append(t.name)
+                            if (t.description.isNotBlank()) {
+                                append(": ").append(t.description.replace('\n', ' ').take(80))
+                            }
+                            append('\n')
+                        }
+                        if (result.tools.size > 30) {
+                            append("…（还有 ${result.tools.size - 30} 个未列出）\n")
+                        }
+                    }
+                    append("\n★ 这只是探测结果，**还没有保存**。若用户想添加，")
+                    append("调用 mcp_save_draft（同一个 url）—— 那会给用户看一张确认卡。")
+                }
+            }
+        }
+    }
+
+    /**
+     * `mcp_save_draft` 的实现 —— **只起草，保存由人点**。
+     *
+     * ★ 返回值是"已经给用户看确认卡了"，不是"已保存"。
+     */
+    suspend fun draftMcp(rawUrl: String): String {
+        // ★★★ 核对「真的探测过吗」。
+        //   模型完全可能跳过 probe 直接编一个"服务器名 + 工具数"——
+        //   而那会是纯虚构的配置，用户在确认框里看到的全是假的。
+        val probed = mcpProbedByUrl[rawUrl]
+            ?: return "ERROR: 这个地址还没有探测过。请先调用 mcp_probe 确认它真的能连上、" +
+                "真的暴露了工具，再来起草。"
+
+        val existing = runCatching { settings.mcpServers() }.getOrDefault(emptyList())
+        val verdict = com.chatmobile.mcp.McpDraftPolicy.check(
+            serverName = probed.serverName,
+            url = rawUrl,
+            serverVersion = probed.serverVersion,
+            probed = true,                       // ★ 宿主说了算，不是模型
+            toolCount = probed.tools.size,       // ★ 同上
+            transport = probed.transport,
+            existingUrls = existing.map { it.url }.toSet(),
+        )
+
+        return when (verdict) {
+            is com.chatmobile.mcp.McpDraftPolicy.Verdict.Rejected ->
+                "ERROR: ${verdict.reason}。${verdict.hint}"
+            is com.chatmobile.mcp.McpDraftPolicy.Verdict.Ok -> {
+                val draft = verdict.draft
+                // ★ 弹确认卡 —— 用户第一次有机会拒绝。
+                val added = awaitToolConfirm(
+                    com.chatmobile.tools.PendingToolConfirm.forMcpDraft(
+                        // 确认框里显示的是**脱敏地址 + 工具数 + "这是模型提议的"**
+                        com.chatmobile.mcp.McpDraftPolicy.confirmMessage(draft),
+                    ),
+                )
+                if (!added) {
+                    return "用户没有添加这个 MCP 服务器。不要重试，也不要说它已经加上了。"
+                }
+                runCatching { settings.addMcpServer(draft) }
+                    .onSuccess { mcpRegistry.invalidate() }
+                    .getOrElse {
+                        return "ERROR: 保存失败：${it.message ?: it::class.simpleName}。"
+                    }
+                // ★ 保存后刷新工具模式，让新工具立刻进入下一轮的工具表。
+                runCatching { toolModeMap = settings.toolModeMap() }
+                "已添加。它的工具会在**下一轮**对话进入工具表，默认是「按需」——" +
+                    "不占常驻上下文，模型要用时才查。"
+            }
+        }
+    }
+
+    // ---- 确认框要显示的三个"人类视角"的事实 ----
+    //
+    // ★ 为什么要在执行**之前**去读一次文件系统：用户要在点"允许"之前知道
+    //   "这会覆盖我原来的文件吗"。等执行完再说就晚了。
+    // ★ 全部包 runCatching：预览失败绝不能阻断真正的操作，
+    //   最多是确认框少一行说明（退化成"模型想写入文件"+路径）。
+
+    /** 这次写操作的目标路径（相对路径按工作区根解析，与执行器保持一致）。 */
+    fun peekWriteTargetPath(argsJson: String, wsInfo: com.chatmobile.prompt.RuntimeFacts.WorkspaceInfo?): String? =
+        runCatching {
+            val p = promptArgString(argsJson, "path")?.trim().orEmpty()
+            if (p.isEmpty()) return@runCatching null
+            if (p.startsWith("/")) p else (wsInfo?.path?.let { "$it/$p" } ?: p)
+        }.getOrNull()
+
+    /** 该目标是否**已经存在**（存在即意味着这次是覆盖，不是新建）。 */
+    fun peekWriteWillOverwrite(argsJson: String, wsInfo: com.chatmobile.prompt.RuntimeFacts.WorkspaceInfo?): Boolean? =
+        runCatching {
+            if (promptArgBool(argsJson, "append") == true) return@runCatching false // 追加不会丢旧内容
+            val path = peekWriteTargetPath(argsJson, wsInfo) ?: return@runCatching null
+            java.io.File(path).exists()
+        }.getOrNull()
+
+    /** 要写多少字符 —— 让用户对"这一下会改动多大"有量感。 */
+    fun peekContentChars(argsJson: String, toolName: String): Int? =
+        runCatching {
+            if (toolName != "write_file") return@runCatching null
+            promptArgString(argsJson, "content")?.length
+        }.getOrNull()
+
     /** 当前会话的权限档位（null ⇒ 默认档）。 */
     fun currentPermission(): com.chatmobile.workspace.WorkspacePermission =
         com.chatmobile.workspace.WorkspacePermission.fromName(currentPermissionValue)
@@ -400,6 +1010,48 @@ fun ChatHost(
     val sidebarState = rememberSidebarState()
 
     /**
+     * 把当前会话绑定的工作区组装成**模型能读到的那一份**运行时事实。
+     *
+     * ## ★★★ 为什么必须有这个函数（真机上「workspace: none」的根因）
+     *
+     * `RuntimeFacts.render` 早就支持 `workspace: WorkspaceInfo?` 参数，也会渲染
+     * 路径与权限档位。但送进提示词的调用点是 `RuntimeFactsProvider.collect(context)`
+     * —— 它压根没有接收工作区的形参。
+     *
+     * ⇒ 无论用户在界面上怎么绑，模型拿到的永远是「Workspace: none」。
+     * 用户真机撞到了，模型自己还猜了半天（它只能看到 none）。真因是**这条线没接**。
+     *
+     * ★ 为什么在这里拼而不是把 DAO 传进 provider：provider 在 `prompt/` 层，
+     *   它不该知道 Room（否则没法纯 JVM 单测）。查库/取路径留在 ChatHost，
+     *   provider 只收一个纯数据类。
+     */
+    suspend fun buildWorkspaceInfo(
+        convId: String?,
+    ): com.chatmobile.prompt.RuntimeFacts.WorkspaceInfo? {
+        val id = convId ?: return null
+        return runCatching {
+            val conv = repo.conversation(id) ?: return@runCatching null
+            val wsId = conv.workspaceId ?: return@runCatching null
+            val row = RepoHolder.get(context).workspaceDao().all()
+                .firstOrNull { it.id == wsId } ?: return@runCatching null
+            val kind = com.chatmobile.data.WorkspaceKind.fromPersisted(row.kind)
+            val permission = com.chatmobile.workspace.WorkspacePermission
+                .fromName(conv.workspacePermission)
+            com.chatmobile.prompt.RuntimeFacts.WorkspaceInfo(
+                displayName = row.name.ifBlank { row.id.take(8) },
+                // ★ 共享工作区给模型看的是**暂存区路径**，不是 SAF 的 treeUri。
+                //   模型不能直接操作 DocumentFile（流式、无随机访问），
+                //   它只在私有暂存区里干活，由我们推送到共享目录。
+                path = workspaceFs.workingDir(row.id, kind).absolutePath,
+                permissionValue = permission.promptValue,
+                permissionHint = permission.promptHint,
+            )
+        }.onFailure {
+            Log.w("ChatHost", "工作区信息组装失败（本轮提示词会写 none）", it)
+        }.getOrNull()
+    }
+
+    /**
      * 位置权限的申请器 —— 必须在 [requestLocationPermissionOnce] 之前声明
      * （Kotlin 局部函数不提升，同文件内的 `val` 也一样：先声明后使用）。
      *
@@ -421,7 +1073,19 @@ fun ChatHost(
     suspend fun refreshConversations() {
         val list = repo.listConversations()
         conversations.clear()
-        conversations.addAll(list.map { Conversation(id = it.id, title = it.title, updatedAt = it.updatedAt) })
+        conversations.addAll(
+            list.map {
+                Conversation(
+                    id = it.id,
+                    title = it.title,
+                    updatedAt = it.updatedAt,
+                    // ★ 带上 pinned：侧边栏要画置顶标记，长按菜单也要据此决定
+                    //   显示「置顶」还是「取消置顶」。库里的排序已经是
+                    //   `pinned DESC, updatedAt DESC`，UI 层不再重排。
+                    pinned = it.pinned,
+                )
+            },
+        )
     }
 
     /**
@@ -980,11 +1644,25 @@ fun ChatHost(
             // ★ 工具配置：冷启动载入一次快照。
             //   不载入的话，工具设置页会显示全关（map 为空 ⇒ 走默认值，
             //   而默认值只有 ChatTools 知道），用户会以为配置丢了。
-            runCatching { settings.toolEnabledMap() }
-                .onSuccess { toolEnabledMap = it }
+            runCatching { settings.toolModeMap() }
+                .onSuccess { toolModeMap = it }
                 .onFailure { Log.w("ChatHost", "工具配置载入失败，按默认值显示", it) }
             runCatching { settings.toolResultChars() }
                 .onSuccess { toolResultChars = it }
+            // ★ 专用搜索服务也在这里载入：不载入的话设置页会显示空，
+            //   用户以为没配过，重新填一遍会覆盖掉原来的配置。
+            runCatching { settings.searchEndpoint() }
+                .onSuccess { ep ->
+                    searchEndpointText = ep?.base.orEmpty()
+                    searchApiKeyText = ep?.apiKey.orEmpty()
+                }
+                .onFailure { Log.w("ChatHost", "搜索服务配置载入失败", it) }
+            // ★ 提示词模板也在这里载入 —— 且**必须**在这里载入：
+            //   `promptTemplates()` 内部带一次性旧数据迁移（老的单字符串 → 模板），
+            //   不读它就永远不会触发，老用户升级后会看到空列表。
+            runCatching { settings.promptTemplates() }
+                .onSuccess { promptTemplatesState = it }
+                .onFailure { Log.w("ChatHost", "提示词模板载入失败", it) }
 
             val list = repo.listConversations()
             if (list.isEmpty()) {
@@ -1020,7 +1698,19 @@ fun ChatHost(
         }
     }
 
-    suspend fun runStreaming(conversationId: String, assistantId: String, prompt: String) {
+    suspend fun runStreaming(
+        conversationId: String,
+        assistantId: String,
+        prompt: String,
+        /**
+         * 本条用户消息携带的附件（元数据）。
+         *
+         * ★ 只有**最后一条**（本轮刚发的 user 消息）带附件 ——
+         *   历史消息的附件不再重发（图片 base64 每次重传会让请求体爆炸，
+         *   而且 token 费用也按图片算）。见下面 ⑤ 处对最后一帧的处理。
+         */
+        attachments: List<com.chatmobile.data.MessageAttachmentMeta> = emptyList(),
+    ) {
         // ★ 多配置模型：从 SettingsState 里取**当前选中的那一份**。
         //   `null` = 一份都没配；`!isComplete` = 那份缺 Key 或模型名。
         //   两种都提示去配置，但文案要能区分 —— 用户照着做才找得到地方。
@@ -1163,6 +1853,28 @@ fun ChatHost(
             CompressionPrefix("", emptySet())
         }
 
+        // ★★★ 附件：在**构造请求之前**读出来。
+        //
+        //   为什么必须在这里（而不是落库时）：落库只存元数据，
+        //   字节在发送这一刻才读 —— 见 `data.MessageAttachmentMeta` 的注释。
+        //
+        //   ★ 读失败**不阻断发送**：某一项读不到就在正文里写明"未发送"，
+        //     让模型和用户都知道少了什么。宁可少发一张图，也不要让整条消息发不出去。
+        val attachmentRead = if (attachments.isEmpty()) {
+            com.chatmobile.attachments.AttachmentReader.ReadResult(
+                emptyList(), emptyList(), emptyList(),
+            )
+        } else {
+            withContext(Dispatchers.IO) {
+                com.chatmobile.attachments.AttachmentReader(context).read(attachments)
+            }
+        }
+        Log.i(
+            "ChatHost",
+            "附件：图片 ${attachmentRead.images.size} 张 / 文本 ${attachmentRead.textFiles.size} 个" +
+                " / 失败 ${attachmentRead.failures.size} 项",
+        )
+
         // 已被摘要覆盖的消息不再作为独立消息发出（摘要里已经有它们）
         val historyForRequest = historyAll
             .filter { it.id !in compression.coveredMessageIds }
@@ -1203,13 +1915,28 @@ fun ChatHost(
         //
         //   ★ 为什么中间插 system 是安全的：OpenAI 兼容协议允许 system 出现在
         //     任意位置，DeepSeek / OpenRouter / OpenCode 实测都接受。
+        // ★★★ 工作区信息在**构造请求之前**就要取到手，因为它有两个消费方：
+        //   ① 运行时事实（让模型"知道"自己在哪个目录、什么档位）
+        //   ② 文件工具的执行层（让模型"真的"只能动那个目录）
+        //   只喂给 ① 不喂 ②，就是"提示词里写着有权限、实际一调就报错"——
+        //   那正是本项目反复出现的「机制都在、连接不存在」的形态。
+        val wsInfo = buildWorkspaceInfo(activeId)
+
+        // ★ 专用搜索服务（第二级）：发送前读一次。
+        //   用 lambda 现读是没必要加重的一次 IO —— 一轮之内用户改不了它，
+        //   而且它不在会话表上。读一次缓存进局部变量即可。
+        val searchEndpointCache = runCatching { settings.searchEndpoint() }.getOrNull()
+
         val requestMessages = mutableListOf<NetChatMessage>().apply {
             // ① 固定系统提示词 —— 永远是第一条，且与上轮逐字相同
             add(NetChatMessage.system(com.chatmobile.prompt.SystemPrompt.STATIC))
-            // ①.5 用户自写提示词（人设/规矩）—— 紧跟固定提示词：
-            //     它只在用户编辑时变，位置固定 ⇒ 不打散后面的缓存前缀。
+            // ①.5 用户自写的**提示词模板**（人设/规矩）—— 紧跟固定提示词：
+            //     它只在用户切换/编辑模板时变，位置固定 ⇒ 不打散后面的缓存前缀。
             //     ★ 与记忆严格分开：记忆是"观察到的你"，这里是"你的指令"。
-            val customPrompt = settings.load().customPrompt.trim()
+            //     ★★★ 走 `effectivePromptText()` 这个**单一入口**，不在这里
+            //        自己去碰模板集合再取 selected.text —— 否则"选中的已被删"
+            //        这类边界会在每个调用点各错一次。
+            val customPrompt = settings.effectivePromptText().trim()
             if (customPrompt.isNotEmpty()) add(NetChatMessage.system(customPrompt))
             // ② 压缩摘要（append-only）
             if (compression.text.isNotBlank()) add(NetChatMessage.system(compression.text))
@@ -1219,8 +1946,25 @@ fun ChatHost(
                 addAll(historyForRequest.subList(0, lastIdx))
                 // ④ 记忆 —— 插在最后一条消息**之前**，这样它前面的一切仍可命中
                 if (memoryText.isNotBlank()) add(NetChatMessage.system(memoryText))
-                // ⑤ 最后一条（通常是刚发的 user）
-                add(historyForRequest[lastIdx])
+                // ⑤ 最后一条（通常是刚发的 user）—— ★ 附件只挂这一条
+                //
+                //   为什么只挂最后一条：历史消息的图片每次重传会让请求体成倍膨胀，
+                //   而且图片 token 是**按张计费**的。已经聊过的图不该反复付钱。
+                //   （代价是模型看不到历史轮的图 —— 但它当时已经描述过了，
+                //    后续追问靠那段描述就够。）
+                val last = historyForRequest[lastIdx]
+                add(
+                    if (attachmentRead.isEmpty && attachmentRead.failures.isEmpty()) {
+                        last
+                    } else {
+                        // ★ 文本文件与失败项**内联进正文**（协议里没有 file 类型），
+                        //   图片走 images 字段（builder 会把 content 变成数组）。
+                        NetChatMessage.user(
+                            content = last.content + attachmentRead.toPromptSection(),
+                            images = attachmentRead.images,
+                        )
+                    },
+                )
             } else if (memoryText.isNotBlank()) {
                 add(NetChatMessage.system(memoryText))
             }
@@ -1239,7 +1983,22 @@ fun ChatHost(
             //
             //   ★ 采集全部包在 runCatching 里（见 RuntimeFactsProvider）——
             //     拿不到位置权限时写 "unavailable"，绝不影响这次发送。
-            val runtimeFacts = com.chatmobile.prompt.RuntimeFactsProvider.collect(context)
+            //
+            //   ★★★ 工作区必须从**当前会话**查出来传进去（真机 bug 的修复）。
+            //     之前这里只传 context ⇒ 模型永远看到 "Workspace: none"。
+            val runtimeFacts = com.chatmobile.prompt.RuntimeFactsProvider.collect(
+                context = context,
+                workspace = wsInfo,
+            )
+            // ★ 诊断：模型到底有没有看到工作区。没有这行，
+            //   「模型说 workspace none」只能靠猜是数据没写还是线没接。
+            Log.i(
+                "ChatHost",
+                "运行时事实：工作区 = " + (
+                    wsInfo?.let { "${it.displayName} @ ${it.path} [${it.permissionValue}]" }
+                        ?: "none"
+                    ),
+            )
             if (runtimeFacts.isNotBlank()) add(NetChatMessage.system(runtimeFacts))
         }
 
@@ -1275,30 +2034,147 @@ fun ChatHost(
         //   ⇒ 在循环外算一次，循环内复用同一个 String 实例。
         //
         //   ★ 空表 ⇒ null ⇒ 请求里**不发 tools 字段**（发空数组有些网关 400）。
-        val enabledTools = settings.enabledToolNames()
+        // ★★★ 工具表按**三种模式**构建（用户要求：可逐个选择常驻还是懒加载）
+        //
+        //   | 模式 | 在请求里 | 模型能看到 |
+        //   |---|---|---|
+        //   | Resident | 完整 schema | 全部参数 |
+        //   | Lazy | 只进 describe_tool 的目录 | 名字 + 一句话 |
+        //   | Disabled | 完全不出现 | 看不到 |
+        //
+        //   ★ 为什么值得：工具定义排在请求**最前面**且每轮全量发送。
+        //     10 个工具 ≈ 800 token/轮；50 个 ≈ 4000 token/轮。
+        //     目录模式下基本恒定在 ~400 token ⇒ **工具越多省得越狠**。
+        //     将来 MCP 铺开（可能上百个工具）时，这是唯一可行的做法。
+        // ★★★ MCP 工具（P2）：**先探测，再算模式，再建表**。
+        //
+        //   顺序不能换：MCP 工具的**模式**存在同一个 `tools_enabled` 里，
+        //   而 `toolModeMap()` 需要知道有哪些工具才能给出默认值。
+        //   若先算模式再探测，MCP 工具这一轮就完全没有模式 ⇒ 既不在常驻也不在懒加载
+        //   ⇒ **加进来却不存在**（这正是"机制都在，唯独连接不存在"那种错误）。
+        val mcpServers = runCatching { settings.mcpServers() }.getOrDefault(emptyList())
+            .filter { it.enabled }
+        val mcpDefinitions = runCatching {
+            mcpRegistry.buildDefinitions(mcpServers) { server ->
+                mcpProbe.probe(server.url)
+            }
+        }.getOrDefault(emptyList())
+
+        // ★ 元工具也要参与模式计算 —— 否则它们的 `preferredMode`（常驻）取不到，
+        //   会被当成"没出现过"而按默认值走，与设置页看到的可能不一致。
+        val toolModes = runCatching {
+            settings.toolModeMap(chatmobile.tools.McpTools.all() + mcpDefinitions)
+        }.getOrDefault(emptyMap())
+        val enabledTools = toolModes
+            .filterValues { it != chatmobile.tools.ToolMode.Disabled }
+            .keys
+        val lazyTools = toolModes
+            .filterValues { it == chatmobile.tools.ToolMode.Lazy }
+            .keys
         // ★ 记忆开关每轮读一次就够 —— 发送是一个瞬时动作，
         //   用户不可能在这次请求的中途把它改掉；而且 lambda 里不能调 suspend。
         val memoryOn = runCatching { settings.isMemoryEnabled() }.getOrDefault(true)
-        val toolsJson = if (enabledTools.isEmpty()) null else {
-            val reg = chatmobile.tools.ToolRegistry()
-            chatmobile.tools.ChatTools.all()
-                .filter { it.name in enabledTools }
-                .forEach { reg.register(it.spec, NOOP_EXECUTOR) }
-            reg.toOpenAiToolsJson().takeIf { it != "[]" }
-        }
+        // ★ 内建工具 + MCP 元工具（配置用）+ MCP 动态工具，一起进目录构建。
+        //   ★★ 顺序纪律：**内建在前、MCP 在后** —— 内建那 10 个的顺序已冻结，
+        //      把 MCP 插到中间会让所有内建工具在缓存前缀里的位置平移。
+        //
+        //   ★ MCP 元工具（`mcp_probe` / `mcp_save_draft`）**总是**进表：
+        //     它们是"配置 MCP"这条链的入口。若按"有没有 MCP"决定给不给，
+        //     那条链就永远启动不了 —— 用户没配过 ⇒ 没有 MCP ⇒ 不给配置工具 ⇒ 永远配不了。
+        val allDefinitions = chatmobile.tools.ChatTools.all() +
+            chatmobile.tools.McpTools.all() +
+            mcpDefinitions
+        val catalog = chatmobile.tools.ToolCatalog.build(
+            definitions = allDefinitions.filter { it.name in enabledTools },
+            modes = toolModes,
+        )
+        val toolsJson = catalog.toolsJson
         // ★ 打一行工具表诊断 —— 「模型没用工具」有两种完全不同的原因：
         //   ① 工具表压根没发出去（enabledTools 为空 / 序列化失败）
         //   ② 工具表发了，但模型选择不用
         //   这两者的排查方向相反，不打日志就只能猜。而"猜"正是本项目最贵的错误来源。
         Log.i(
             "ChatHost",
-            "工具表：启用 ${enabledTools.size} 个 [${enabledTools.joinToString(",")}]；" +
+            "工具表：常驻 ${catalog.resident.size} 个 [${catalog.resident.joinToString(",")}]；" +
+                "懒加载 ${catalog.lazy.size} 个 [${catalog.lazy.joinToString(",")}]；" +
                 "序列化 ${toolsJson?.length ?: 0} 字符",
         )
         val toolHost = com.chatmobile.tools.AndroidToolHost(
             context = context,
             memoryBank = memoryBank,
             memoryEnabled = { memoryOn },
+            // ★★★ 文件工具的边界就在这两个 lambda 里。
+            //
+            //   为什么用 lambda 而不是把值算好传进去：用户在快捷面板里换工作区时，
+            //   要求的是「**下一轮**生效」。这份 host 是一轮一个实例，但它在两轮之间
+            //   可能被复用（例如同一轮里模型连续调三次工具），
+            //   期间用户完全可能已经改了档位 ⇒ 每次执行都现读一次才准。
+            //
+            //   ★ 没有工作区时回 null —— 文件工具会**如实拒绝**并告诉模型该怎么办，
+            //     而不是让它去猜一个路径然后反复失败。
+            workspaceRoot = {
+                runCatching { wsInfo?.path }.getOrNull()
+            },
+            workspacePermission = {
+                com.chatmobile.workspace.WorkspacePermission
+                    .fromPromptValue(wsInfo?.permissionValue)
+            },
+            // ★★★ MCP 转发（P2）—— 三个回调。
+            //
+            //   ★ 都捕获了**本轮**的 `mcpServers` / `mcpDefinitions` 快照：
+            //     这一轮的工具表就是按这份快照建的，执行时必须用同一份 ——
+            //     否则用户在生成中途改了 MCP 配置，就会出现"表里有、调不到"。
+            mcpIsTool = { name -> mcpRegistry.owns(name, mcpServers) },
+            mcpCall = { name, argsJson -> mcpRegistry.call(name, argsJson, mcpServers) },
+            mcpDefinition = { name -> mcpDefinitions.firstOrNull { it.name == name } },
+            // ★★★ 元工具的两个实现。
+            //
+            //   为什么用 `runBlocking`：`ToolHost` 的接口是**同步**的
+            //   （执行器本身在 IO 调度器上跑，见 `withContext(Dispatchers.IO)`），
+            //   而这两个要读 DataStore / 等确认框 —— 都是 suspend。
+            //   ★ 安全前提：工具执行**永远不在主线程**。这一点由 `runStreaming` 里
+            //     的 `withContext(Dispatchers.IO)` 保证；若哪天那层被去掉，
+            //     这里会立刻表现为 ANR —— 那反而是个响亮的失败，不会被静默忽略。
+            mcpProbeServer = { url -> runBlocking { probeMcp(url) } },
+            mcpDraftServer = { url -> runBlocking { draftMcp(url) } },
+            // ★★★ 搜索三级的第一级：**复用当前模型自己的接入点与 key**。
+            //
+            //   用户原话：「这个搜索工具应该默认复用模型现在的 key 去搜索」。
+            //   理由很直白：他已经为这个模型付过钱、也已经在用它的 key，
+            //   再让他去别处配一个搜索服务是多余的。
+            //
+            //   ★ 只有接入点支持 `POST /v1/tools/search` 时才成功（目前 DeepSeek 官方支持）。
+            //     不支持会 404/405 ⇒ 记进失败列表再降级，不静默跳过。
+            modelSearchEndpoint = {
+                runCatching {
+                    val ep = active.endpointUrl.ifBlank { Providers.byId(active.providerId)?.endpoints?.firstOrNull()?.baseUrl.orEmpty() }
+                    val key = active.apiKey
+                    if (ep.isNotBlank() && key.isNotBlank()) {
+                        com.chatmobile.tools.SearchEndpoint(base = ep, apiKey = key)
+                    } else {
+                        null
+                    }
+                }.getOrNull()
+            },
+            // 第二级：用户在设置里单独配的搜索服务（所有模型共用）
+            customSearchEndpoint = { searchEndpointCache },
+            // ★ 历史检索要排除**当前会话**：用户问"我上次干了什么"时，
+            //   眼前这段对话不该被当成"历史"。
+            conversationIdHint = { activeId },
+            historySearch = { q, mode, days, cnt, exclude ->
+                // ★ 这里在 Dispatchers.IO 上被调用（工具执行器就在 IO），
+                //   所以可以直接跑 Room 的 suspend 查询。
+                runBlocking {
+                    searchHistoryText(
+                        repo = repo,
+                        query = q,
+                        mode = mode,
+                        days = days,
+                        count = cnt,
+                        excludeConversationId = exclude,
+                    )
+                }
+            },
         )
         val toolExecutor = chatmobile.tools.ChatToolExecutor(
             host = toolHost,
@@ -1460,6 +2336,54 @@ fun ChatHost(
                                 argumentsJson = call.argumentsJson,
                             ),
                             enabled = enabledSet,
+                            // ★ 懒加载工具**可被召回、也必须可被调用** ——
+                            //   否则整个机制是坏的死循环（描述得出来、调不动）。
+                            lazy = lazyTools,
+                            // ★★★ 要不要问用户，由**档位 + 目标位置**决定（用户原话）。
+                            //
+                            //   「如果模型每次改动文件都要问我，会不会让任务断的很难受？
+                            //    只读才需要吧，工作区权限是工作区改不用，工作区外用，
+                            //    完全权限是不用任何确认，此外注意任何读取都不用审批。」
+                            //
+                            //   ⇒ 判据全部落在 WorkspacePermission.requiresConfirmation。
+                            needsConfirm = { toolName, argsJson ->
+                                if (toolName !in FILE_TOOLS) {
+                                    // 非文件类沿用工具自身的静态标记
+                                    chatmobile.tools.ChatTools.byName(toolName)
+                                        ?.requiresConfirmation == true
+                                } else {
+                                    val op = if (toolName == "write_file") {
+                                        com.chatmobile.workspace.FileOperation.WRITE
+                                    } else {
+                                        com.chatmobile.workspace.FileOperation.READ
+                                    }
+                                    val target = peekWriteTargetPath(argsJson, wsInfo)
+                                    // ★ 拿不到路径时算"在工作区内"：
+                                    //   PermissionGuard 紧接着会替我们拒绝越权，
+                                    //   这里多问一次只会白打扰用户。
+                                    val inside = target == null ||
+                                        com.chatmobile.workspace.PermissionGuard.isInside(
+                                            target,
+                                            wsInfo?.path.orEmpty(),
+                                        )
+                                    com.chatmobile.workspace.WorkspacePermission
+                                        .fromPromptValue(wsInfo?.permissionValue)
+                                        .requiresConfirmation(op, inside)
+                                }
+                            },
+                            confirm = { toolName, argsJson ->
+                                runBlocking {
+                                    awaitToolConfirm(
+                                        com.chatmobile.tools.PendingToolConfirm.build(
+                                            toolName = toolName,
+                                            argumentsJson = argsJson,
+                                            targetPath = peekWriteTargetPath(argsJson, wsInfo),
+                                            willOverwrite = peekWriteWillOverwrite(argsJson, wsInfo),
+                                            contentChars = peekContentChars(argsJson, toolName),
+                                        ),
+                                    )
+                                }
+                            },
                         )
                     }
                     val text = when (result) {
@@ -1527,10 +2451,95 @@ fun ChatHost(
 
 
     // ---------------------------------------------------------------
+    // 会话标题自动总结
+    //
+    // ★ 必须声明在 send() **之前**：Kotlin 的局部函数不提升，
+    //   send() 里要调它，就得先有定义（这条本项目已栽过两次）。
+    // ---------------------------------------------------------------
+
+    /**
+     * 用模型给会话起一个标题。
+     *
+     * ## ★ 设计约束（每一条都有理由）
+     *
+     * | 约束 | 为什么 |
+     * |---|---|
+     * | **失败就保持截断标题** | 网络/额度/模型不支持都可能失败；标题不值得报错 |
+     * | **不传思考强度** | 起标题要"概括"，推理纯浪费 token 与时间 |
+     * | **maxTokens = 40** | 一句话标题；给多了模型会附带解释 |
+     * | **只取第一行** | 模型常在标题后补充说明；侧边栏只显示一行 |
+     * | **剥引号与「标题：」前缀** | 模型爱写 `标题：「xxx」`，原样显示很难看 |
+     * | **20 字上限** | 侧边栏一行放得下这么多；超出反正会被省略号截断 |
+     *
+     * ★ 为什么 temperature = 0.3 而不是 0：起标题要稳定，但实测 0.0 时
+     *   模型经常直接抄用户原句（"帮我看看这个"，完全不概括）。
+     */
+    suspend fun generateTitle(convId: String, userText: String) {
+        runCatching {
+            val state = settings.load()
+            val profile = state.active ?: return@runCatching
+            val preset = Providers.byId(profile.providerId) ?: return@runCatching
+            val endpoint = Providers.resolveEndpoint(profile.providerId, profile.endpointUrl)
+                ?: preset.defaultEndpoint
+
+            // 取最新几条里最后一条助手消息（答太长会稀释重点）
+            // ★ `MessageEntity.role` 是**字符串**（Room 存的就是 string），
+            //   拿 MessageRole.ASSISTANT 枚举去比会编译失败。
+            val answer = repo.latestMessages(convId, limit = 4)
+                .lastOrNull { it.role.equals(MessageRole.ASSISTANT.name, ignoreCase = true) }
+                ?.content
+                .orEmpty()
+                .take(400)
+
+            val provider = ProviderFactory.createFromPreset(
+                preset = preset,
+                apiKey = profile.apiKey,
+                endpoint = endpoint,
+                model = profile.model,
+                sessionId = profile.id,
+            )
+            val req = ChatRequest(
+                model = profile.model,
+                messages = listOf(
+                    NetChatMessage.system(TITLE_PROMPT),
+                    NetChatMessage.user(
+                        "【用户】\n" + userText.take(500) + "\n\n【助手】\n" + answer,
+                    ),
+                ),
+                // ★ 空 = 不传该字段，让服务端用默认。起标题不需要额外推理。
+                reasoningEffort = null,
+                temperature = 0.3,
+                maxTokens = 40,
+            )
+
+            val sb = StringBuilder()
+            provider.stream(req).collect { ev ->
+                when (ev) {
+                    is ChatEvent.Delta -> sb.append(ev.text)
+                    else -> Unit
+                }
+            }
+            val title = sanitizeTitle(sb.toString())
+            if (title.isNotBlank()) {
+                repo.renameConversation(convId, title)
+                refreshConversations()
+                Log.i("ChatHost", "会话标题已生成：$title")
+            }
+        }.onFailure {
+            // ★ 失败只记日志：留在截断标题上，用户完全不受影响。
+            Log.w("ChatHost", "标题总结失败（保持截断标题）", it)
+        }
+    }
+
+    // ---------------------------------------------------------------
     // 发送
     // ---------------------------------------------------------------
     fun send(text: String) {
         val convId = activeId ?: return
+        // ★★ 附件在**这一刻**取走并清空 —— 用户点了发送，附件就该跟着这条消息走。
+        //   之后连点发送不会重复带上同一张图。
+        val attachSnapshot = pendingAttachments
+        pendingAttachments = emptyList()
         isGenerating = true
         streamJob = scope.launch {
             // ★ 两条消息先落库再上屏：这样"发出去一半就被杀进程"也不会丢用户那句。
@@ -1539,6 +2548,9 @@ fun ChatHost(
                 role = MessageRole.USER,
                 content = text,
                 status = MessageStatus.DONE,
+                // ★ 元数据落库：消息气泡上要能显示"带了 1 张图、1 个文件"，
+                //   重开 App 也还在。
+                attachments = attachSnapshot,
             )
             val aiRow = repo.appendMessage(
                 conversationId = convId,
@@ -1549,14 +2561,28 @@ fun ChatHost(
             messages.add(userRow.toUi())
             messages.add(aiRow.toUi(isStreaming = true))
 
-            // 会话标题：首条消息用它，让侧边栏能认出是哪个会话
-            if (messages.count { it.role == ChatMessage.Role.User } == 1) {
+            // 会话标题：首条消息先用**截断**兜底，让侧边栏立刻有东西可认。
+            // ★ 真正的标题由模型总结生成（见 generateTitle），但那要走一次网络请求，
+            //   不能让用户等 —— 所以先截断顶上，总结好了再替换。
+            val isFirstUserMessage = messages.count { it.role == ChatMessage.Role.User } == 1
+            if (isFirstUserMessage) {
                 repo.renameConversation(convId, text.take(20))
                 refreshConversations()
             }
 
             // ---- 真实模型调用 ----
-            runStreaming(convId, aiRow.id, text)
+            runStreaming(convId, aiRow.id, text, attachSnapshot)
+
+            // ★★★ 首轮结束后用模型总结标题（用户要求：首次对话自动总结）。
+            //
+            //   放在**回答之后**而不是之前：标题该概括"这一轮谈了什么"，
+            //   而模型的第一句回答里往往包含了它理解到的主题。只看用户那句话，
+            //   总结出来经常是「询问关于…的问题」这种没信息量的东西。
+            //
+            //   ★ 失败不影响任何东西（有截断标题兜底），所以不用 try/catch 包。
+            if (isFirstUserMessage) {
+                generateTitle(convId, userText = text)
+            }
         }
     }
 
@@ -1682,6 +2708,48 @@ fun ChatHost(
                         sidebarState.dragTo(0f)
                         layer = NavLayer.Settings
                     },
+                    // ---- 长按菜单：置顶 ----
+                    //
+                    // ★ 不做乐观更新（先改本地再写库）：`refreshConversations()`
+                    //   会按库里的顺序重建整个列表，乐观更新立刻被覆盖 ——
+                    //   看起来像"点了置顶闪一下又回去了"。直接写库再重刷，顺序以库为准。
+                    onTogglePin = { id, wantPinned ->
+                        scope.launch {
+                            runCatching { repo.setPinned(id, wantPinned) }
+                                .onFailure { Log.w("ChatHost", "置顶失败", it) }
+                            refreshConversations()
+                        }
+                    },
+                    // ---- 长按菜单：重命名 ----
+                    //
+                    // ★ 与「自动总结标题」共用同一条写入路径（repo.renameConversation）。
+                    //   用户手动改过的标题**不会**被自动总结覆盖 —— 自动总结只在
+                    //   首轮触发，而首轮早就过去了。
+                    onRenameConversation = { id, newTitle ->
+                        scope.launch {
+                            runCatching { repo.renameConversation(id, newTitle) }
+                                .onFailure { Log.w("ChatHost", "重命名失败", it) }
+                            refreshConversations()
+                        }
+                    },
+                    // ---- 长按菜单：删除 ----
+                    onDeleteConversation = { id ->
+                        scope.launch {
+                            runCatching { repo.deleteConversation(id) }
+                                .onFailure { Log.w("ChatHost", "删除会话失败", it) }
+                            // ★ 删掉的正好是当前打开的会话 ⇒ 必须换到别的会话，
+                            //   否则界面还停在一条已不存在的记录上：发消息会写进
+                            //   一个已删除的会话（外键会让它失败，但用户看到的是一条莫名其妙的报错）。
+                            if (id == activeId) {
+                                val next = conversations.firstOrNull { it.id != id }?.id
+                                activeId = next
+                                messages.clear()
+                                if (next != null) loadMessages(next)
+                            }
+                            refreshConversations()
+                            refreshActiveConversationMeta()
+                        }
+                    },
                 )
             },
         ) {
@@ -1717,6 +2785,14 @@ fun ChatHost(
                     settingsState.reasoningAutoCollapse ==
                         com.chatmobile.ui.chat.ReasoningAutoCollapse.AfterAnswer,
                 bodyFontSize = settingsState.chatFontSize,
+                onPickImage = { launchPickImage() },
+                onPickFile = { launchPickFile() },
+                onTakePhoto = { launchTakePhoto() },
+                // ★ 待发附件：选完立刻出现在输入框上方，发送时随消息走
+                pendingAttachments = pendingAttachments,
+                onRemoveAttachment = { index ->
+                    pendingAttachments = pendingAttachments.filterIndexed { i, _ -> i != index }
+                },
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -1890,9 +2966,15 @@ fun ChatHost(
                 memoryBank.purgeDeleted()
                 refreshMemories()
             },
-            customPrompt = settingsState.customPrompt,
-            onSavePrompt = { text ->
-                scope.launch { settings.setCustomPrompt(text) }
+            promptTemplates = promptTemplatesState,
+            onSavePromptTemplates = { set ->
+                scope.launch {
+                    settings.setPromptTemplates(set)
+                    // ★ 立刻回读：以**落库后的真实值**为准（L26 的同一思路）。
+                    //   只改本地 state 会让"点了一下没反应"这类问题被掩盖，
+                    //   而这里尤其重要 —— 删除模板会连带修复选中项，那是 Policy 算的。
+                    promptTemplatesState = settings.promptTemplates()
+                }
             },
             memoryTuning = settingsState.memoryTuning,
             onSaveTuning = { tuning ->
@@ -1909,21 +2991,62 @@ fun ChatHost(
         // 工具设置（设置的下级）
         // =============================================================
         NavLayer.Tools -> com.chatmobile.settings.ToolsScreen(
-            enabledMap = toolEnabledMap,
+            modeMap = toolModeMap,
             resultChars = toolResultChars,
             onBack = { layer = NavLayer.Settings },
-            onToggle = { name, enabled ->
+            onModeChange = { name, mode ->
                 scope.launch {
-                    settings.setToolEnabled(name, enabled)
-                    // ★ 立刻回读一次，让开关状态以**落库后的真实值**为准。
+                    settings.setToolMode(name, mode)
+                    // ★ 立刻回读一次，让状态以**落库后的真实值**为准。
                     //   只改本地 state 会让"点了一下没反应"这类问题被掩盖。
-                    toolEnabledMap = settings.toolEnabledMap()
+                    toolModeMap = settings.toolModeMap()
                 }
             },
             onSaveResultChars = { chars ->
                 scope.launch {
                     settings.setToolResultChars(chars)
                     toolResultChars = settings.toolResultChars()
+                }
+            },
+            searchEndpoint = searchEndpointText,
+            searchApiKey = searchApiKeyText,
+            onSaveSearchEndpoint = { base, key ->
+                scope.launch {
+                    settings.setSearchEndpoint(base, key)
+                    // ★ 立刻回读：让界面以**落库后的真实值**为准（L26 的同一思路）。
+                    val ep = settings.searchEndpoint()
+                    searchEndpointText = ep?.base.orEmpty()
+                    searchApiKeyText = ep?.apiKey.orEmpty()
+                }
+            },
+            mcpServers = mcpServersForUi,
+            mcpDefinitions = mcpDefsForUi,
+            onToggleMcp = { url, enabled ->
+                scope.launch {
+                    settings.setMcpEnabled(url, enabled)
+                    // ★ 停用/启用会改变工具表 ⇒ 必须清缓存并重新探测，
+                    //   否则"停用了却还能用"（工具清单是缓存里的旧的）。
+                    mcpRegistry.invalidate()
+                    mcpServersForUi = settings.mcpServers()
+                    val live = mcpServersForUi.filter { it.enabled }
+                    mcpDefsForUi = withContext(Dispatchers.IO) {
+                        mcpRegistry.buildDefinitions(live) { mcpProbe.probe(it.url) }
+                    }
+                    toolModeMap = settings.toolModeMap(mcpDefsForUi)
+                }
+            },
+            onRemoveMcp = { url ->
+                scope.launch {
+                    settings.removeMcpServer(url)
+                    // ★ 删除必须清缓存：不清的话注册表里还留着那个服务器的工具，
+                    //   而 owns() 已经认不出它们了 ⇒ 会变成"看得见、调不了"的僵尸工具。
+                    mcpRegistry.invalidate()
+                    mcpServersForUi = settings.mcpServers()
+                    val live = mcpServersForUi.filter { it.enabled }
+                    mcpDefsForUi = withContext(Dispatchers.IO) {
+                        mcpRegistry.buildDefinitions(live) { mcpProbe.probe(it.url) }
+                    }
+                    toolModeMap = settings.toolModeMap(mcpDefsForUi)
                 }
             },
             modifier = modifier.fillMaxSize(),
@@ -1942,6 +3065,68 @@ fun ChatHost(
             autoCollapse = settingsState.reasoningAutoCollapse,
             themeMode = settingsState.themeMode,
             fontSize = settingsState.chatFontSize,
+            // ★ 从 BuildConfig 取，不写死 —— 会随版本变化的事实一律指向运行时来源。
+            currentVersion = com.chatmobile.BuildConfig.VERSION_NAME,
+            updateState = updateState,
+            checkingUpdate = checkingUpdate,
+            updateChannel = updateChannel,
+            onCheckUpdate = {
+                if (checkingUpdate) return@GeneralScreen
+                checkingUpdate = true
+                updateState = null
+                updateChannel = null
+                scope.launch {
+                    val checker = com.chatmobile.update.UpdateChecker(
+                        currentVersion = com.chatmobile.BuildConfig.VERSION_NAME,
+                    )
+                    val r = checker.check()
+                    updateState = r.check
+                    updateChannel = r.channel
+                    checkingUpdate = false
+                }
+            },
+            onOpenUpdate = { info ->
+                // ★ 优先直接给 APK 下载地址；没有就退化成开 Release 页面。
+                //   两者都用系统浏览器 —— 我们**不做应用内下载安装**：
+                //   那需要 REQUEST_INSTALL_PACKAGES 权限，是一个远超"聊天客户端"
+                //   的授权面，而用户用手浏览器下载一次就完事了。
+                openExternalUrl(info.apkUrl ?: info.pageUrl)
+            },
+            // ★ 没有梯子时的出路：把地址交给系统浏览器，用户自己复制/换网络都行。
+            onOpenUrl = { url -> openExternalUrl(url) },
+            allFilesAccessGranted = allFilesAccessGranted,
+            allFilesRoute = allFilesRoute,
+            onRequestAllFilesAccess = {
+                // ★★★ MANAGE_EXTERNAL_STORAGE **不是运行时权限**，
+                //   `requestPermissions()` 对它无效 —— 必须跳到系统的
+                //   「本 App 专属」设置页。用错 API 的表现是"点了没反应"，很难查。
+                //
+                // ★★ 而且这一步**必须先探测**（见 probeAllFilesRoutes）：
+                //   MIUI 上这组设置页根本不存在，硬跳就是"点了没反应"。
+                //   探测不到时 UI 层已经不给按钮了，这里只是防御性兜底。
+                val action = when (allFilesRoute) {
+                    com.chatmobile.permission.AllFilesAccessGate.Route.AppPage ->
+                        com.chatmobile.permission.AllFilesAccessGate.ACTION_APP_PAGE
+                    com.chatmobile.permission.AllFilesAccessGate.Route.ListPage ->
+                        com.chatmobile.permission.AllFilesAccessGate.ACTION_LIST_PAGE
+                    com.chatmobile.permission.AllFilesAccessGate.Route.Unavailable -> null
+                }
+                if (action == null) {
+                    Log.w("ChatHost", "这台机器没有「所有文件访问」设置页，不跳转")
+                } else {
+                    runCatching {
+                        val intent = android.content.Intent(action)
+                        if (action == com.chatmobile.permission.AllFilesAccessGate.ACTION_APP_PAGE) {
+                            intent.data = android.net.Uri.parse("package:${context.packageName}")
+                        }
+                        context.startActivity(
+                            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }.onFailure { e ->
+                        Log.w("ChatHost", "打开全盘访问设置页失败：$action", e)
+                    }
+                }
+            },
             onBack = { layer = NavLayer.Settings },
             onPermissionChange = { p ->
                 scope.launch { settings.setDefaultPermission(p) }
@@ -2077,6 +3262,24 @@ fun ChatHost(
             },
         )
     }
+
+    // =============================================================
+    // 工具确认框 —— `requiresConfirmation` 的唯一 UI 出口
+    //
+    // ★ 位置在 `when` 之外，与快速切换弹窗同理：确认可能在任何一层发生
+    //   （比如用户正在设置页里改工具开关时，后台那轮回答要写文件）。
+    // ★ 必须**阻塞**那一轮工具执行直到用户点：见 awaitToolConfirm。
+    // =============================================================
+    pendingConfirm?.let { req ->
+        com.chatmobile.tools.ToolConfirmDialog(
+            request = req,
+            onDecision = { allowed ->
+                // ★ 只允许决定一次：重复点会把 result 覆盖成后点的那个，
+                //   而执行方只 await 一次 —— 表现是"点了拒绝却还是写了"。
+                if (!req.decision.isCompleted) req.decision.complete(allowed)
+            },
+        )
+    }
 }
 
 /**
@@ -2200,14 +3403,171 @@ enum class NavLayer { Chat, Settings, ModelConfig, Memories, Tools, Workspaces, 
 private class StreamAborted(val reason: String) : Exception(reason)
 
 /**
+ * 「＋」菜单的三个入口。
+ *
+ * ★ 单独做成枚举而不是三个不相干的回调：三个入口共用一个
+ *   `ActivityResultLauncher`，回调回来时必须知道**是哪一次**触发的 ——
+ *   否则"拍照返回 OK 但 data == null"会被当成"选文件时按了取消"处理。
+ */
+private enum class AttachKind { Image, File, Photo }
+
+/**
  * 工具循环的**轮数上限**。
  *
- * ★ 为什么必须有：模型可能反复调同一个工具（尤其参数一直错的时候）。
+ * ★ 为什么必须有：模型可能反复调用同一个工具（尤其参数一直错的时候）。
  *   不设上限会变成死循环，把用户的 token 烧光，而界面上只是"一直在转"。
  * ★ 为什么是 8：真实链路最长的是「查时间 → 抓两个网页 → 检索记忆 → 存一条 → 作答」，
  *   5 轮。留 3 轮余量。再多就说明模型在打转，那时停下比继续烧钱好。
  */
 private const val MAX_TOOL_ROUNDS = 8
+
+/**
+ * 跨会话历史检索的**唯一实现** —— `search_history` 工具落地在这里。
+ *
+ * ## ★★★ 用户定的设计（照抄原话，这是判据）
+ *
+ * > 「我的想法是，现有的注入规则不变，当我提到时模型再去查且能查到」
+ *
+ * 拆成两条硬约束：
+ * 1. **注入规则不变** ⇒ 不动记忆抽取提示词、不动注入预算。
+ *    记忆库继续只装「关于用户的稳定画像」，历史**不进常驻上下文**。
+ * 2. **提到时再查** ⇒ 按需拉取，只为这一次查询付 token。
+ *
+ * 这正是"能力在，但不占地方"的做法：能力靠工具暴露给模型，
+ * 而不是靠把一切塞进 system prompt。
+ *
+ * ## 两种模式
+ * - `search`：关键词 `LIKE` 跨会话搜（**不是语义检索** —— 描述里已写清，
+ *   否则模型搜不到同义词会得出"不存在"的错误结论）
+ * - `recent`：按时间倒序列出最近的会话 + 每个会话最近一条用户诉求，
+ *   用来回答"我这周在忙什么"
+ */
+private suspend fun searchHistoryText(
+    repo: ChatRepository,
+    query: String?,
+    mode: String?,
+    days: Int?,
+    count: Int,
+    excludeConversationId: String?,
+): String {
+    val now = System.currentTimeMillis()
+    val since = days?.coerceIn(1, 3650)?.let { now - it * 24L * 3600_000L }
+
+    return if (mode == "recent") {
+        // ---- 模式二：按时间列最近会话 ----
+        val conversations = repo.listConversations(includeArchived = false)
+            .filter { since == null || it.updatedAt >= since }
+            .take(count)
+        if (conversations.isEmpty()) {
+            return "没有符合条件的会话" +
+                if (days != null) "（最近 ${days} 天）" else "" + "。"
+        }
+        buildString {
+            append("最近的 ").append(conversations.size).append(" 个对话：\n")
+            for (c in conversations) {
+                append("\n■ ").append(c.title.ifBlank { "（无标题）" })
+                append("　").append(formatRelativeTime(c.updatedAt, now)).append('\n')
+                // ★ 只取用户消息：助手的长回答会把结果撑爆，而"在做什么"
+                //   通常写在用户的诉求里。
+                val asks = runCatching { repo.recentUserMessages(c.id, 2) }.getOrDefault(emptyList())
+                if (asks.isEmpty()) {
+                    append("   （还没有用户消息）\n")
+                } else {
+                    asks.asReversed().forEach { m ->
+                        append("   用户：").append(m.content.replace('\n', ' ').take(100)).append('\n')
+                    }
+                }
+            }
+        }.trimEnd()
+    } else {
+        // ---- 模式一：关键词搜 ----
+        val q = query?.trim().orEmpty()
+        if (q.isEmpty()) return "ERROR: 缺少 query。若想看最近的对话，请传 mode=recent。"
+
+        val hits = repo.searchMessagesAcross(q, excludeConversationId, count)
+            .filter { since == null || it.createdAt >= since }
+
+        if (hits.isEmpty()) {
+            // ★ 这句极其重要：搜不到**不等于不存在**。
+            //   必须明说"这是关键词匹配"，否则模型会告诉用户"你没做过这件事"。
+            return buildString {
+                append("没有找到包含「").append(q).append("」的历史消息")
+                if (days != null) append("（最近 ").append(days).append(" 天）")
+                append("。\n")
+                append("注意：这是**关键词**匹配，不是语义检索。")
+                append("可以换个更短或更常见的词再试一次，例如只搜核心名词。")
+            }
+        }
+
+        // 命中消息 -> 会话标题（按会话分组，避免同一标题重复出现很多次）
+        val titles = hits.map { it.conversationId }.distinct()
+            .associateWith { id -> runCatching { repo.conversation(id)?.title }.getOrNull() }
+
+        buildString {
+            append("找到 ").append(hits.size).append(" 条包含「").append(q).append("」的历史消息：\n")
+            hits.forEach { m ->
+                val title = titles[m.conversationId]?.ifBlank { "（无标题）" } ?: "（已删除的对话）"
+                val who = when (m.role) {
+                    MessageRole.USER.name -> "用户"
+                    MessageRole.ASSISTANT.name -> "助手"
+                    else -> m.role
+                }
+                append("\n■ 对话《").append(title).append("》")
+                append("　").append(formatRelativeTime(m.createdAt, now)).append('\n')
+                append("  ").append(who).append("：")
+                append(m.content.replace('\n', ' ').take(160))
+                if (m.content.length > 160) append("…")
+                append('\n')
+            }
+            append("\n（要看完整内容，请让用户打开对应的对话。这里只给命中片段。）")
+        }.trimEnd()
+    }
+}
+
+/**
+ * 把时间戳渲染成**给模型读的相对时间**。
+ *
+ * ★ 为什么用相对时间而不是 `2026-11-04 10:23`：
+ *   模型的训练数据有截止日期，"10:23" 它得自己算多久以前；
+ *   而「3 小时前」是它能直接用来组织语言的量。
+ * ★ 保留"今天/昨天"这种人类词 —— 用户说"昨天那个对话"时，
+ *   模型需要能一眼对上。
+ */
+private fun formatRelativeTime(at: Long, now: Long): String {
+    val diff = now - at
+    return when {
+        diff < 0 -> "刚刚"
+        diff < 60_000 -> "刚刚"
+        diff < 3600_000 -> "${diff / 60_000} 分钟前"
+        diff < 24 * 3600_000L -> "${diff / 3600_000} 小时前"
+        diff < 48 * 3600_000L -> "昨天"
+        diff < 30 * 24 * 3600_000L -> "${diff / (24 * 3600_000L)} 天前"
+        else -> {
+            val days = diff / (24 * 3600_000L)
+            if (days < 365) "${days / 30} 个月前" else "${days / 365} 年前"
+        }
+    }
+}
+
+
+/**
+ * 文件类工具的名字集合。
+ *
+ * ★ 为什么需要：确认判据对这两类完全相反 —— 读取**永远不问**，写入看档位。
+ *   靠名字判断比靠 `ToolKind` 更直接：这里的语义就是"碰文件系统的那几个"。
+ */
+private val FILE_TOOLS = setOf("read_file", "write_file", "list_dir")
+
+/**
+ * 等用户点「允许 / 拒绝」的最长时间。
+ *
+ * ★ 超时 = **拒绝**，不是放行。
+ *   放行会让确认框退化成"2 分钟后自动执行" —— 那比没有确认框更糟，
+ *   因为用户会以为自己有保护。
+ * ★ 60 秒的依据：确认框出现时用户可能正在看别的界面，但也不算长到
+ *   让人以为 App 卡死（那期间界面上一直显示着这个框与倒计时之外的提示）。
+ */
+private const val TOOL_CONFIRM_TIMEOUT_MS = 60_000L
 
 /**
  * 只为序列化工具 schema 而存在的空执行器。
@@ -2285,6 +3645,8 @@ private fun MessageEntity.toUi(isStreaming: Boolean = false): ChatMessage {
         //   把它们改成 stopped，所以这里只有"正在本次会话里流式输出"才为 true。
         isStreaming = isStreaming,
         timestamp = createdAt,
+        // ★ 附件元数据：气泡上要显示"带了什么"。解析失败退化成空列表，不抛。
+        attachments = MessageAttachmentCodec.decode(attachments),
     )
 }
 
@@ -2398,6 +3760,36 @@ internal data class MemoryOp(
     val content: String?,
     val ids: List<String>,
 )
+
+/**
+ * 从一个工具参数 JSON 里取字符串字段。
+ *
+ * ★ 为什么不用 `org.json`：它在 JVM 单测里是**空 stub**（方法体全是 throw），
+ *   用它写的逻辑一行都测不了。这是本项目在 core-memory 上已经栽过一次的坑。
+ * ★ 解析失败一律回 null，绝不抛 —— 确认框的预览信息不值得让整轮对话失败。
+ */
+internal fun promptArgString(json: String, key: String): String? = runCatching {
+    val root = kotlinx.serialization.json.Json.parseToJsonElement(json)
+        as? kotlinx.serialization.json.JsonObject ?: return null
+    val p = root[key] as? kotlinx.serialization.json.JsonPrimitive ?: return null
+    if (!p.isString) null else p.content
+}.getOrNull()
+
+/**
+ * 从一个工具参数 JSON 里取布尔字段。
+ *
+ * ★ 两种形态都要认：JSON 布尔 `true`，以及模型常写的字符串 `"true"`。
+ *   只认一种的话，`append` 会**静默失效** —— 表现是覆盖了用户本该追加的文件。
+ */
+internal fun promptArgBool(json: String, key: String): Boolean? = runCatching {
+    val root = kotlinx.serialization.json.Json.parseToJsonElement(json)
+        as? kotlinx.serialization.json.JsonObject ?: return null
+    val p = root[key] as? kotlinx.serialization.json.JsonPrimitive ?: return null
+    when {
+        !p.isString -> p.content.trim().equals("true", ignoreCase = true)
+        else -> p.content.trim().toBooleanStrictOrNull()
+    }
+}.getOrNull()
 
 /**
  * 解析记忆管理员输出。
@@ -2616,6 +4008,85 @@ op 四种：
 5. 最多 ${maxOps} 条 op。没有值得记的就输出 {"ops":[]}，不要为凑数编造。
 6. 不要输出解释、不要 markdown 代码块。
 """.trimIndent()
+}
+
+/**
+ * 起会话标题用的提示词。
+ *
+ * ## ★ 为什么写得这么死板
+ *
+ * 模型给标题时有三类常见"跑偏"，每一条都在这段里堵住：
+ * 1. **写成一句话总结**（"用户询问了关于向量检索的问题并讨论了实现细节"）
+ *    ⇒ 侧边栏一行放不下，信息密度极低。要求 4–12 字、名词短语。
+ * 2. **带上「标题：」或引号** ⇒ 界面原样显示，很难看。明确要求只输出标题本身。
+ * 3. **语言** —— 这条**不写死**：用户可能用英文问，硬要求中文会得到中英混杂的怪标题。
+ */
+private const val TITLE_PROMPT = """You name chat conversations.
+
+Output ONLY the title itself — no quotes, no "Title:", no explanation, no markdown.
+
+Rules:
+- 4 to 12 words (or 4 to 12 Chinese characters). Short enough for one narrow sidebar row.
+- A noun phrase describing the topic, not a sentence: "Kotlin 协程调度" not "用户问了协程怎么调度".
+- Same language as the conversation.
+- If the topic is unclear, name the concrete subject mentioned, not "闲聊" or "提问".
+"""
+
+/**
+ * 把模型吐出来的「标题」清洗成能直接显示的字符串。
+ *
+ * 做成纯函数是为了可单测 —— 这类清洗错一格，侧边栏就会出现
+ * `标题：「xxx」` 或者半个换行，而那种瑕疵在真机上一眼看见时已经晚了。
+ *
+ * 处理的事（都是实测见过的形态）：
+ * - 取**第一行**（模型常在标题后补一段解释）
+ * - 剥掉 `标题：` / `Title:` 前缀
+ * - 剥掉包裹的引号（`"` `'` `「」` `『』` `**`），可叠加
+ * - 合并内部多余空白
+ * - 限长 20 字符（超出侧边栏必然被省略号截断，不如自己先截）
+ */
+internal fun sanitizeTitle(raw: String): String {
+    if (raw.isBlank()) return ""
+    var t = raw.trim().lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+
+    // 前缀（中英文都见过）。★ 用 case-insensitive 的 regionMatches 判断，
+    //   再按**实际长度**切 —— 不能用 removePrefix（它区分大小写，
+    //   `TITLE:` 这种全大写就漏了）。
+    for (p in listOf("对话标题：", "对话标题:", "标题：", "标题:", "Title:", "Title：", "题目：")) {
+        if (t.length >= p.length && t.regionMatches(0, p, 0, p.length, ignoreCase = true)) {
+            t = t.substring(p.length).trim()
+            break
+        }
+    }
+    // ★ 兜底：万一模型写的是 `标题 :`（冒号前有空格）或者只剩个冒号，
+    //   上面按长度切会留下一个孤零零的 `：` —— 那不是标题。
+    //   剥掉残留的引导标点，剥完为空就让调用方落到截断标题上。
+    t = t.trimStart('：', ':', '-', '—', ' ', '\u3000')
+
+    // 包裹符号（可能叠加，如 **「标题」**）
+    val wrappers = listOf(
+        "\"" to "\"", "'" to "'",
+        "「" to "」", "『" to "』",
+        "“" to "”", "‘" to "’",
+        "**" to "**",
+    )
+    var changed = true
+    while (changed) {
+        changed = false
+        for ((open, close) in wrappers) {
+            if (t.length > open.length + close.length &&
+                t.startsWith(open) && t.endsWith(close)
+            ) {
+                t = t.substring(open.length, t.length - close.length).trim()
+                changed = true
+            }
+        }
+    }
+
+    // 内部空白压缩（模型有时用全角空格或连续空格）
+    t = t.replace(Regex("""[\s\u3000]+"""), " ").trim()
+    if (t.length > 20) t = t.take(20).trim()
+    return t
 }
 
 private const val WELCOME =
